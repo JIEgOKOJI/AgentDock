@@ -1,0 +1,51 @@
+{
+  "name": "agentdock",
+  "version": "0.1.0",
+  "private": true,
+  "author": {
+    "name": "jiegokoji",
+    "email": "jiegokoji@gmail.com"
+  },
+  "homepage": "https://github.com/jiegokoji",
+  "description": "A cross-platform desktop workspace for CLI coding agents",
+  "desktopName": "AgentDock",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test test/*.test.cjs",
+    "start": "electron .",
+    "dist": "npm run build && node scripts/package.cjs",
+    "dist:win": "npm run build && node scripts/package.cjs --win --x64",
+    "dist:linux": "npm run build && node scripts/package.cjs --linux --x64",
+    "dist:mac": "npm run build && node scripts/package.cjs --mac --arm64"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "cross-env": "latest",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "typescript": "latest",
+    "wait-on": "latest"
+  },
+  "build": {
+    "appId": "dev.agentdock.desktop",
+    "productName": "AgentDock",
+    "files": ["dist/**/*", "electron/**/*", "build/icon.png", "package.json"],
+    "directories": { "output": "release", "buildResources": "build" },
+    "win": { "target": "nsis", "icon": "build/icon.ico" },
+    "mac": { "target": "dmg", "icon": "build/icon.icns" },
+    "linux": { "target": ["AppImage", "deb"], "icon": "build/icon.png", "category": "Development", "syncDesktopName": true }
+  }
+}

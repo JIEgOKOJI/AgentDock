@@ -1,0 +1,82 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+release/
+out/
+build/Release/
+build/Debug/
+*.tsbuildinfo
+
+# Installers / packaged binaries
+*.exe
+*.exe.blockmap
+*.msi
+*.msix
+*.appx
+*.appxupload
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.snap
+*.AppImage
+*.nupkg
+*.zip
+*.7z
+*.tar.gz
+*.tgz
+*.iso
+
+# Electron-builder unpacked output
+win-unpacked/
+win-unpacked.tmp/
+mac-unpacked/
+linux-unpacked/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Agents & MCP
+.agents/
+.agent/
+agents/
+.claude/
+.opencode/
+.opencode.json
+.opencode.jsonc
+.codebase-memory/
+.codeium/
+.tabnine/
+.aider*
+.aider.conf*
+.continue/
+.windsurf/
+.cursor/
+.github/copilot/
+.zed/
+.mcp/
+.mcp.json
+.mcp.jsonc
+*.mcp.json
+mcp-config.json
+.codebase-memory/
