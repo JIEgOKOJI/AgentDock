@@ -6,7 +6,7 @@ AgentDock is a cross-platform Electron desktop app for working with multiple cod
 
 ![AgentDock screenshot](assets/screenshot.png)
 
-> AgentDock is currently at an early stage (`0.1.0`). It runs locally and uses the authentication and configuration of the installed CLIs.
+> AgentDock is currently at an early stage (`0.2.0`). It runs locally and uses the authentication and configuration of the installed CLIs.
 
 ## Why AgentDock
 
@@ -15,7 +15,7 @@ Coding-agent CLIs usually keep their own history, configuration, and workflows. 
 - **Switch providers without starting over.** Recent user and assistant messages, the active Git branch, and attachments are passed to the next CLI as continuation context.
 - **Keep work project-oriented.** Sessions are stored locally and grouped by workspace rather than by provider.
 - **Use Skills across CLIs.** AgentDock discovers project and global Skills, detects divergent copies, shares them between supported locations, and can inject selected global Skills into runs.
-- **See MCP servers in one place.** Results reported by the installed Codex, Claude, and OpenCode CLIs are merged into a single view.
+- **See MCP servers in one place.** Results reported by the installed Codex, Claude, and OpenCode CLIs are merged into a single read-only view, and a unified manager lets you add, edit, sync, and verify servers across all three CLIs from one catalog.
 - **Use one permission selector.** Ask, Auto, and Full modes are translated into provider-specific CLI arguments and configuration.
 - **Follow what the agent is doing.** JSON/JSONL output is normalized into messages, reasoning where available, commands, tool activity, and file-change summaries.
 
@@ -57,6 +57,17 @@ The CLI session id, last user prompt, last exit code, and run-failed flag are pe
 AgentDock discovers Skills from supported global and project locations, groups matching copies by name and content hash, and identifies conflicts. Skills can be created, opened, shared between provider locations, or enabled as defaults for every run.
 
 The MCP view runs each installed CLI's native list command and merges the reported servers. AgentDock does not proxy MCP traffic or modify the returned server list.
+
+### Unified MCP manager
+
+The MCP manager is a separate view that treats MCP servers as first-class, cross-provider objects. Instead of editing each CLI's config files by hand, you maintain one catalog and apply it to every provider.
+
+- **One catalog, three CLIs.** Each server entry declares which providers (Codex, Claude Code, OpenCode) it applies to, its scope (global or workspace), transport (stdio, SSE, or HTTP), command/args/env, URL, and headers. The `agentdock-browser` server is reserved and cannot be edited here.
+- **Import from existing configs.** Codex `config.toml`, Claude `~/.claude.json` and workspace `.mcp.json`, and OpenCode `opencode.json` are read into the unified format. Servers found in multiple providers are merged by name, preserving each provider tag. Project-scoped files are imported when a workspace is active.
+- **Sync back to CLI configs.** "Apply changes" writes the catalog into each provider's native config files, scoped by the server's `providers` and `scope`. Existing CLI-only entries are preserved, and a timestamped backup of every touched file is written to `userData/mcp-backups` before any change. The read-only MCP view and the running agents are unaffected; the next CLI launch picks up the updated config.
+- **Health checks.** A per-server check verifies that a stdio command resolves on `PATH` (`where`/`which`) or that an HTTP/SSE endpoint returns a status below 500.
+- **Conflict detection.** Servers present in a CLI config but absent from the catalog, or whose command/URL/transport/enabled state diverges, are surfaced as conflicts so you can reconcile them with a sync.
+- **Portable export/import.** The whole catalog (or selected servers) can be exported to a JSON file and imported on another machine, merging by server name.
 
 ### Permissions, Git, and attachments
 
@@ -157,15 +168,17 @@ electron/
   browser-mcp.cjs      Loopback HTTP MCP bridge with bearer token and tool schemas
   browser-mcp-config.cjs
                         Ephemeral provider MCP injection and browser-awareness prompt
+  mcp-manager.cjs      Unified MCP catalog: store, import/sync to CLI configs, health, conflicts, export/import
 src/
   App.tsx              React interface and session workflow
   components/
     MoreMenu.tsx       "More" dropdown with embedded-browser entry
     BrowserView.tsx    Browser chrome, address bar, bounds placeholder, agent-action bar
+    McpManagerView.tsx Unified MCP manager UI: list, filters, editor, sync, health, conflicts, export/import
   agent-events.mjs     Provider output normalization
   activity-format.mjs
                        Human-readable activity descriptions
-test/                  Node test suite for adapters, permissions, skills, browser URL/MCP config, and event parsing
+test/                  Node test suite for adapters, permissions, skills, browser URL/MCP config, event parsing, and MCP manager store/sync/health/conflicts
 test/fixtures/browser-site/
                        HTML fixture for integration testing of browser automation
 ```
