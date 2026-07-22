@@ -51,7 +51,11 @@ test('plan: parseOpenQuestions deduplicates', () => {
 })
 
 test('plan: classifyPlanReadiness returns needs_answers when questions exist', () => {
-  assert.equal(plan.classifyPlanReadiness('plan', [{ id: '1', kind: 'text', text: 'what?' }]), 'needs_answers')
+  assert.equal(plan.classifyPlanReadiness('plan', [{ id: '1', kind: 'text', text: 'what?', required: true }]), 'needs_answers')
+})
+
+test('plan: classifyPlanReadiness returns ready when required questions are answered', () => {
+  assert.equal(plan.classifyPlanReadiness('plan', [{ id: '1', kind: 'text', text: 'what?', required: true, answer: 'yes' }]), 'ready')
 })
 
 test('plan: classifyPlanReadiness returns ready when no questions and no uncertainty', () => {
@@ -92,6 +96,7 @@ test('plan: writePlanContract includes answers', () => {
   const contract = plan.readPlanContract(dir, 's1')
   assert.ok(contract.raw.includes('PostgreSQL'))
   assert.ok(contract.raw.includes('Which db?'))
+  assert.ok(contract.answersHash)
 })
 
 test('plan: verifyPlanHash returns true for matching hash', () => {
@@ -99,6 +104,17 @@ test('plan: verifyPlanHash returns true for matching hash', () => {
   const result = plan.writePlanContract(dir, 's1', 'Plan', [])
   assert.ok(plan.verifyPlanHash(dir, 's1', result.hash))
   assert.ok(!plan.verifyPlanHash(dir, 's1', 'wrong'))
+})
+
+test('plan: verifyPlanContentHash detects tampered plan body', () => {
+  const dir = tempDir()
+  const result = plan.writePlanContract(dir, 's1', 'Original plan', [])
+  const contract = plan.readPlanContract(dir, 's1')
+  const tampered = contract.raw.replace('Original plan', 'Tampered plan')
+  fs.writeFileSync(contract.path, tampered, 'utf8')
+  const verify = plan.verifyPlanContentHash(dir, 's1')
+  assert.equal(verify.ok, false)
+  assert.notEqual(verify.recomputed, verify.stored)
 })
 
 test('plan: readPlanContract returns null when no plan', () => {

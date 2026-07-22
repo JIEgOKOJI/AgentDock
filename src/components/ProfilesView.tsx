@@ -88,6 +88,7 @@ export function ProfilesView() {
   }
 
   const remove = async (profile: CredentialProfile) => {
+    if (!window.confirm(`Delete profile "${profile.name}"?\nThe configuration directory on disk is not touched.`)) return
     setError('')
     setNotice('')
     try {

@@ -64,9 +64,12 @@ test('budget: normalizeBudget returns enabled for positive number', () => {
   assert.equal(result.maxUsd, 5.0)
 })
 
-test('budget: normalizeBudget accepts zero as disabled', () => {
+test('budget: normalizeBudget treats zero as enabled hard cap', () => {
   const result = budget.normalizeBudget(0)
-  assert.equal(result.enabled, false)
+  assert.equal(result.enabled, true)
+  assert.equal(result.maxUsd, 0)
+  assert.equal(result.zero, true)
+  assert.equal(result.omitted, false)
 })
 
 test('budget: normalizeBudget rejects negative', () => {

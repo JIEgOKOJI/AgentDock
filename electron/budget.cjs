@@ -1,15 +1,28 @@
 const path = require('node:path')
 const fs = require('node:fs')
+const crypto = require('node:crypto')
 
 const BUDGET_VERSION = 1
 
+const PRICING_SNAPSHOT_VERSION = 1
+const PRICING_SNAPSHOT_DATE = '2026-07-23'
+
 const PROVIDER_COST_MODELS = {
-  codex: { type: 'subscription', marginalCostPerRun: 0 },
-  claude: { type: 'subscription', marginalCostPerRun: 0 },
+  codex: { type: 'subscription', marginalCostPerRun: 0, marginalSubscription: true },
+  claude: { type: 'subscription', marginalCostPerRun: 0, marginalSubscription: true },
   opencode: { type: 'api', inputPricePer1M: 2.5, outputPricePer1M: 10, cachedInputPricePer1M: 0.3 },
 }
 
 const DEFAULT_MODEL_OVERRIDES = {}
+
+function pricingSnapshot() {
+  return {
+    version: PRICING_SNAPSHOT_VERSION,
+    date: PRICING_SNAPSHOT_DATE,
+    source: 'hardcoded',
+    models: { ...PROVIDER_COST_MODELS },
+  }
+}
 
 function getCostModel(provider, model) {
   const base = PROVIDER_COST_MODELS[provider] || PROVIDER_COST_MODELS.opencode
@@ -21,7 +34,7 @@ function estimateRunCost(provider, model, usage) {
   if (!usage || typeof usage !== 'object') return { cost: 0, type: 'unknown', unverifiable: true }
   const costModel = getCostModel(provider, model)
   if (costModel.type === 'subscription') {
-    return { cost: 0, type: 'subscription', unverifiable: false }
+    return { cost: 0, type: 'subscription', unverifiable: false, marginalSubscription: Boolean(costModel.marginalSubscription) }
   }
   if (costModel.type === 'api') {
     const inputTokens = Number(usage.inputTokens) || 0
@@ -38,16 +51,24 @@ function estimateRunCost(provider, model, usage) {
 }
 
 function normalizeBudget(value) {
-  if (value == null) return { maxUsd: null, enabled: false }
+  if (value == null) return { maxUsd: null, enabled: false, omitted: true }
   const num = typeof value === 'number' ? value : parseFloat(value)
-  if (!Number.isFinite(num) || num < 0) return { maxUsd: null, enabled: false }
-  return { maxUsd: num, enabled: num > 0 }
+  if (!Number.isFinite(num) || num < 0) return { maxUsd: null, enabled: false, omitted: true }
+  if (num === 0) return { maxUsd: 0, enabled: true, omitted: false, zero: true }
+  return { maxUsd: num, enabled: true, omitted: false }
 }
 
 function checkBudget(spend, budget) {
   if (!budget.enabled || budget.maxUsd == null) return { exceeded: false, remaining: null }
   const remaining = Math.round((budget.maxUsd - spend) * 1_000_000) / 1_000_000
   return { exceeded: spend >= budget.maxUsd, remaining: Math.max(0, remaining) }
+}
+
+function hasBudgetHeadroom(spend, budget) {
+  if (!budget.enabled || budget.maxUsd == null) return { allowed: true, remaining: null }
+  if (budget.zero) return { allowed: false, remaining: 0, reason: 'zero_budget' }
+  const remaining = Math.round((budget.maxUsd - spend) * 1_000_000) / 1_000_000
+  return { allowed: remaining > 0, remaining: Math.max(0, remaining) }
 }
 
 function budgetDir(userData) {
@@ -99,13 +120,61 @@ function profileSpend(userData, sessionId, profileId) {
   return totalSpend(entries.filter((entry) => entry.profileId === profileId))
 }
 
+const reservations = new Map()
+
+function reserveBudget(sessionId, amount, metadata = {}) {
+  const key = String(sessionId || '')
+  if (!reservations.has(key)) reservations.set(key, { total: 0, items: [] })
+  const ledger = reservations.get(key)
+  const id = crypto.randomUUID().slice(0, 8)
+  ledger.items.push({ id, amount, ts: Date.now(), ...metadata })
+  ledger.total = Math.round((ledger.total + amount) * 1_000_000) / 1_000_000
+  return { id, reserved: amount, totalReserved: ledger.total }
+}
+
+function releaseReservation(sessionId, reservationId) {
+  const key = String(sessionId || '')
+  const ledger = reservations.get(key)
+  if (!ledger) return false
+  const item = ledger.items.find((i) => i.id === reservationId)
+  if (!item) return false
+  ledger.items = ledger.items.filter((i) => i.id !== reservationId)
+  ledger.total = Math.round((ledger.total - item.amount) * 1_000_000) / 1_000_000
+  return true
+}
+
+function settleReservation(sessionId, reservationId, actualCost) {
+  const key = String(sessionId || '')
+  const ledger = reservations.get(key)
+  if (!ledger) return false
+  const item = ledger.items.find((i) => i.id === reservationId)
+  if (!item) return false
+  const delta = Math.round((actualCost - item.amount) * 1_000_000) / 1_000_000
+  ledger.items = ledger.items.filter((i) => i.id !== reservationId)
+  ledger.total = Math.round((ledger.total + delta) * 1_000_000) / 1_000_000
+  return true
+}
+
+function totalReserved(sessionId) {
+  const ledger = reservations.get(String(sessionId || ''))
+  return ledger ? ledger.total : 0
+}
+
+function clearReservations(sessionId) {
+  reservations.delete(String(sessionId || ''))
+}
+
 module.exports = {
   BUDGET_VERSION,
+  PRICING_SNAPSHOT_VERSION,
+  PRICING_SNAPSHOT_DATE,
   PROVIDER_COST_MODELS,
+  pricingSnapshot,
   getCostModel,
   estimateRunCost,
   normalizeBudget,
   checkBudget,
+  hasBudgetHeadroom,
   budgetDir,
   ensureBudgetDir,
   ledgerPath,
@@ -114,4 +183,9 @@ module.exports = {
   totalSpend,
   sessionSpend,
   profileSpend,
+  reserveBudget,
+  releaseReservation,
+  settleReservation,
+  totalReserved,
+  clearReservations,
 }

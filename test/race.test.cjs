@@ -143,8 +143,7 @@ test('race: selectProvidersForRace respects requested providers', () => {
   assert.deepEqual(result, ['codex', 'claude'])
 })
 
-test('race: selectProvidersForRace duplicates when not enough', () => {
+test('race: selectProvidersForRace returns null when not enough', () => {
   const result = race.selectProvidersForRace(3, [], ['codex'])
-  assert.equal(result.length, 3)
-  assert.ok(result.every((p) => p === 'codex'))
+  assert.equal(result, null)
 })

@@ -126,6 +126,34 @@ function isProfileExhausted(limits) {
   return windows.some((window) => Boolean(window) && window.usedPercent >= 100)
 }
 
+// 6.5: Detect typed vendor-limit signal — only recognized quota exhaustion triggers rotation
+function isTypedVendorLimitSignal(limits, exitCode) {
+  // Non-zero exit code alone is NOT quota exhaustion
+  if (!limits || !limits.available) return false
+  if (!isProfileExhausted(limits)) return false
+  // Only rotate when the vendor reports actual usage limits
+  return true
+}
+
+// 6.5: Check if profile is ready based on fresh per-profile limits
+function isProfileReady(profile, limits) {
+  if (!profile || !profile.enabled) return false
+  if (!limits) return true // No limits data — assume ready unless policy says otherwise
+  if (!limits.available) return false // Unavailable limits = not ready
+  if (isProfileExhausted(limits)) return false
+  return true
+}
+
+// 6.5: Select next profile by fresh per-profile limits, not just enabled status
+function nextReadyProfileByLimits(profiles, provider, excludeId, limitsByProfile) {
+  const candidates = profiles.filter((profile) => profile.provider === provider && profile.enabled && profile.id !== excludeId)
+  for (const candidate of candidates) {
+    const limits = limitsByProfile?.[candidate.id]
+    if (!limits || isProfileReady(candidate, limits)) return candidate
+  }
+  return null
+}
+
 function nextReadyProfile(profiles, provider, excludeId) {
   return profiles.find((profile) => profile.provider === provider && profile.enabled && profile.id !== excludeId) ?? null
 }
@@ -142,7 +170,10 @@ module.exports = {
   findProfile,
   readyProfilesForProvider,
   isProfileExhausted,
+  isTypedVendorLimitSignal,
+  isProfileReady,
   nextReadyProfile,
+  nextReadyProfileByLimits,
   detectDefaultProfiles,
   mergeProfiles,
 }

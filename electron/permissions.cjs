@@ -50,4 +50,27 @@ function permissionLaunchOptions(provider, requestedMode, baseEnv = process.env)
   return { mode, args: [], env: baseEnv }
 }
 
-module.exports = { normalizePermissionMode, permissionLaunchOptions }
+function readOnlyPermissionOptions(provider, baseEnv = process.env) {
+  if (provider === 'codex') {
+    return { mode: 'ask', args: ['--sandbox', 'read-only', '-c', 'approval_policy="untrusted"'], env: baseEnv }
+  }
+  if (provider === 'claude') {
+    return { mode: 'ask', args: ['--permission-mode', 'manual'], env: baseEnv }
+  }
+  if (provider === 'opencode') {
+    const permission = { edit: 'ask', bash: 'ask', webfetch: 'ask', websearch: 'ask', external_directory: 'ask' }
+    return { mode: 'ask', args: [], env: { ...baseEnv, OPENCODE_CONFIG_CONTENT: mergeOpenCodeConfig(baseEnv.OPENCODE_CONFIG_CONTENT, permission) } }
+  }
+  return { mode: 'ask', args: [], env: baseEnv }
+}
+
+function isReadOnlyIntent(intent) {
+  return intent === 'ask' || intent === 'plan'
+}
+
+function effectivePermissionOptions(provider, intent, requestedMode, baseEnv = process.env) {
+  if (isReadOnlyIntent(intent)) return readOnlyPermissionOptions(provider, baseEnv)
+  return permissionLaunchOptions(provider, requestedMode, baseEnv)
+}
+
+module.exports = { normalizePermissionMode, permissionLaunchOptions, readOnlyPermissionOptions, isReadOnlyIntent, effectivePermissionOptions }

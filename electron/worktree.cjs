@@ -41,9 +41,15 @@ async function ensureBaselineCommit(cwd) {
   return true
 }
 
+async function getBaseTreeHash(cwd) {
+  const result = await execCapture('git', ['rev-parse', 'HEAD'], { cwd })
+  return result.ok ? result.stdout.trim() : null
+}
+
 async function createWorktree(userData, sessionId, runId, sourceCwd) {
   if (!await isGitRepo(sourceCwd)) return { ok: false, error: 'not_a_git_repo', path: null }
   await ensureBaselineCommit(sourceCwd)
+  const baseTreeHash = await getBaseTreeHash(sourceCwd)
   const wtPath = worktreePath(userData, sessionId, runId)
   const branchName = `agentdock/${String(runId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12)}`
   fs.mkdirSync(path.dirname(wtPath), { recursive: true })
@@ -51,11 +57,41 @@ async function createWorktree(userData, sessionId, runId, sourceCwd) {
   if (!result.ok) {
     const resultForce = await execCapture('git', ['worktree', 'add', '--detach', wtPath], { cwd: sourceCwd })
     if (!resultForce.ok) return { ok: false, error: result.stderr || resultForce.stderr, path: null }
+    return { ok: true, path: wtPath, branch: null, baseTreeHash }
   }
-  return { ok: true, path: wtPath, branch: branchName }
+  return { ok: true, path: wtPath, branch: branchName, baseTreeHash }
+}
+
+async function createNonGitEnvelope(userData, sessionId, runId, sourceCwd) {
+  const envelopePath = worktreePath(userData, sessionId, runId)
+  fs.mkdirSync(path.dirname(envelopePath), { recursive: true })
+  fs.mkdirSync(envelopePath, { recursive: true })
+  const skipNames = new Set(['.git', 'node_modules', '.agentdock-baseline'])
+  await fs.promises.cp(sourceCwd, envelopePath, {
+    recursive: true,
+    filter: (src) => {
+      const basename = path.basename(src)
+      return !skipNames.has(basename)
+    },
+  })
+  try {
+    await execCapture('git', ['init'], { cwd: envelopePath })
+    await execCapture('git', ['add', '-A'], { cwd: envelopePath })
+    await execCapture('git', ['-c', 'user.name=AgentDock', '-c', 'user.email=agent@dock.local', 'commit', '-m', 'AgentDock synthetic baseline'], { cwd: envelopePath })
+  } catch (error) {
+    return { ok: false, error: error.message, path: null }
+  }
+  const baseTreeHash = await getBaseTreeHash(envelopePath)
+  fs.writeFileSync(path.join(envelopePath, '.agentdock-baseline'), JSON.stringify({ created: Date.now(), source: sourceCwd, nonGit: true }), 'utf8')
+  return { ok: true, path: envelopePath, branch: null, baseTreeHash, nonGit: true }
 }
 
 async function captureWorktreeDiff(wtPath) {
+  const untrackedResult = await execCapture('git', ['ls-files', '--others', '--exclude-standard'], { cwd: wtPath })
+  if (untrackedResult.ok && untrackedResult.stdout.trim()) {
+    const untrackedFiles = untrackedResult.stdout.split(/\r?\n/).filter(Boolean)
+    await execCapture('git', ['add', '-N', ...untrackedFiles], { cwd: wtPath })
+  }
   const result = await execCapture('git', ['diff', 'HEAD'], { cwd: wtPath })
   return result.ok ? result.stdout : ''
 }
@@ -90,7 +126,7 @@ async function applyPatch(targetCwd, patch) {
   }
 }
 
-async function removeWorktree(sourceCwd, wtPath) {
+async function removeWorktree(sourceCwd, wtPath, branchName = null) {
   if (!wtPath) return { ok: true }
   try {
     await execCapture('git', ['worktree', 'remove', '--force', wtPath], { cwd: sourceCwd })
@@ -98,6 +134,11 @@ async function removeWorktree(sourceCwd, wtPath) {
   try {
     if (fs.existsSync(wtPath)) fs.rmSync(wtPath, { recursive: true, force: true })
   } catch {}
+  if (branchName) {
+    try {
+      await execCapture('git', ['branch', '-D', branchName], { cwd: sourceCwd })
+    } catch {}
+  }
   return { ok: true }
 }
 
@@ -119,7 +160,9 @@ module.exports = {
   isGitRepo,
   getCurrentBranch,
   ensureBaselineCommit,
+  getBaseTreeHash,
   createWorktree,
+  createNonGitEnvelope,
   captureWorktreeDiff,
   applyPatch,
   removeWorktree,

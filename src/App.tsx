@@ -3,7 +3,7 @@ import {
   Blocks, Bot, BrainCircuit, Check, ChevronDown, ChevronRight, CircleStop,
   Command, Folder, GitBranch, KeyRound, Menu, MessageSquareText, RefreshCw,
   PanelLeftClose, Paperclip, PlugZap, Plus, Search, Send, Settings, Sparkles,
-  FileDiff, FileText, Hand, ShieldAlert, ShieldCheck, Share2, TerminalSquare, Wrench, X, Zap,
+  FileDiff, FileText, Hand, ShieldAlert, ShieldCheck, Share2, TerminalSquare, Trash2, Wrench, X, Zap,
 } from 'lucide-react'
 import { parseAgentTranscript } from './agent-events.mjs'
 import { describeActivity } from './activity-format.mjs'
@@ -11,9 +11,17 @@ import { MoreMenu, MoreMenuTrigger } from './components/MoreMenu'
 import { BrowserView } from './components/BrowserView'
 import { McpManagerView } from './components/McpManagerView'
 import { ProfilesView } from './components/ProfilesView'
+import { PlanPanel } from './components/PlanPanel'
+import { OrchestrationControls, defaultOrchestrationConfig, loadOrchestrationPreset, buildRunRequestExtras, buildGatesRequest } from './components/OrchestrationControls'
+import { CompareView, type RaceResultView } from './components/CompareView'
+import { ApprovalInbox } from './components/ApprovalInbox'
+import { Markdown, DiffView } from './components/Markdown'
+import { PipelinePanel, PipelineStrip, loadPipelineConfig, defaultPipelineConfig, validatePipeline, buildStepPrompt, pipelineRoleMeta, parseVerdict } from './components/PipelinePanel'
+import { RunTree } from './components/RunTree'
+import { ArtifactsPanel } from './components/ArtifactsPanel'
 
 type ProviderId = 'codex' | 'claude' | 'opencode'
-type ViewId = 'chat' | 'providers' | 'profiles' | 'mcp' | 'mcp-manager' | 'skills' | 'runs' | 'settings'
+type ViewId = 'chat' | 'providers' | 'profiles' | 'mcp-manager' | 'skills' | 'runs' | 'settings'
 type Message = ChatMessage
 
 const providerMeta: Record<ProviderId, { name: string; badge: string; color: string }> = {
@@ -38,8 +46,7 @@ const nav = [
   { id: 'chat' as ViewId, label: 'Workspace', icon: MessageSquareText },
   { id: 'providers' as ViewId, label: 'Providers', icon: Bot },
   { id: 'profiles' as ViewId, label: 'Profiles', icon: KeyRound },
-  { id: 'mcp' as ViewId, label: 'MCP servers', icon: PlugZap },
-  { id: 'mcp-manager' as ViewId, label: 'MCP manager', icon: Wrench },
+  { id: 'mcp-manager' as ViewId, label: 'MCP servers', icon: PlugZap },
   { id: 'skills' as ViewId, label: 'Skills', icon: Blocks },
   { id: 'runs' as ViewId, label: 'Run artifacts', icon: FileDiff },
 ]
@@ -251,6 +258,8 @@ export default function App() {
   const [profileId, setProfileId] = useState<string | null>(null)
   const [profileMenu, setProfileMenu] = useState(false)
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>([])
+  const [sessionQuery, setSessionQuery] = useState('')
+  const sessionSearchRef = useRef<HTMLInputElement>(null)
   const [usage, setUsage] = useState<TokenUsage>(emptyTokenUsage)
   const [limits, setLimits] = useState<ProviderLimits | null | undefined>(undefined)
   const [contextHandoff, setContextHandoff] = useState(true)
@@ -263,7 +272,21 @@ export default function App() {
   const [typedEvents, setTypedEvents] = useState<Array<Record<string, unknown> & { type: string }>>([])
   const [intent, setIntent] = useState<'agent' | 'plan' | 'ask'>('agent')
   const [planResult, setPlanResult] = useState<PlanResult | null>(null)
+  const [planRefreshToken, setPlanRefreshToken] = useState(0)
+  const [orchestration, setOrchestration] = useState<OrchestrationConfig>(defaultOrchestrationConfig)
+  const [pipeline, setPipeline] = useState<PipelineConfig>(defaultPipelineConfig)
+  const [pipelineTemplates, setPipelineTemplates] = useState<PipelineTemplateOverrides>({})
+  const [pipelineTemplatesSaving, setPipelineTemplatesSaving] = useState(false)
+  const [pipelineRun, setPipelineRun] = useState<PipelineRunState>({ active: false, stepIndex: 0, request: '', outputs: [], fixRounds: 0, awaitingContinue: false, nextIndex: null, error: '' })
+  const [orchestrationValid, setOrchestrationValid] = useState(true)
+  const [raceResult, setRaceResult] = useState<RaceResultView | null>(null)
+  const [raceBusy, setRaceBusy] = useState(false)
+  const [councilBusy, setCouncilBusy] = useState(false)
+  const [approvalRefreshToken, setApprovalRefreshToken] = useState(0)
   const messagesEnd = useRef<HTMLDivElement>(null)
+  const pipelineRef = useRef(pipeline)
+  const pipelineRunRef = useRef(pipelineRun)
+  const pipelineTemplatesRef = useRef(pipelineTemplates)
   const activeRunId = useRef<string | null>(null)
   const lastExitCodeRef = useRef<number | null>(null)
   const limitsRequestId = useRef(0)
@@ -338,7 +361,7 @@ export default function App() {
       setSessionsReady(true)
     }).catch(() => setSessionsReady(true))
     window.agentDock?.getMcpServers().then(setMcpServers).catch(() => {})
-    window.agentDock?.getSettings().then((settings) => { setContextHandoff(settings.contextHandoff); setLimitAction(settings.limitAction ?? 'fail') }).catch(() => {})
+    window.agentDock?.getSettings().then((settings) => { setContextHandoff(settings.contextHandoff); setLimitAction(settings.limitAction ?? 'fail'); setPipelineTemplates(settings.pipelineTemplates ?? {}) }).catch(() => {})
     window.agentDock?.listProfiles().then(setProfiles).catch(() => {})
   }, [])
 
@@ -445,9 +468,12 @@ export default function App() {
       const exitCode = lastExitCodeRef.current
       setLastExitCode(exitCode)
       setLastRunFailed(exitCode !== null && exitCode !== 0)
-      setMessages((items) => items.map((message) => message.pending ? { ...message, pending: false, content, activities: transcript.activities, files: transcript.finalFiles } : message))
+      setMessages((items) => items.map((message) => message.pending ? { ...message, pending: false, at: message.at ?? Date.now(), content, activities: transcript.timeline ?? transcript.activities, files: transcript.finalFiles } : message))
       setRawOutput('')
+      setPlanRefreshToken((value) => value + 1)
+      setApprovalRefreshToken((value) => value + 1)
       void refreshGitInfo()
+      advancePipeline(content, exitCode)
       if (activeSessionId && window.agentDock?.saveCheckpoint && content) {
         window.agentDock.saveCheckpoint({ sessionId: activeSessionId, provider, profileId: profileId ?? '', content: content.slice(0, 4000) }).catch(() => {})
       }
@@ -501,6 +527,31 @@ export default function App() {
   useEffect(() => {
     if (view === 'chat') void refreshGitInfo()
   }, [view, workspace])
+
+  const refreshCliServers = () => {
+    window.agentDock?.getMcpServers().then(setMcpServers).catch(() => {})
+  }
+
+  useEffect(() => {
+    if (view === 'mcp-manager') refreshCliServers()
+  }, [view])
+
+  useEffect(() => {
+    if (workspace) {
+      setOrchestration(loadOrchestrationPreset(workspace))
+      setPipeline(loadPipelineConfig(workspace))
+    }
+  }, [workspace])
+
+  useEffect(() => { pipelineRef.current = pipeline }, [pipeline])
+  useEffect(() => { pipelineRunRef.current = pipelineRun }, [pipelineRun])
+  useEffect(() => { pipelineTemplatesRef.current = pipelineTemplates }, [pipelineTemplates])
+
+  const savePipelineTemplates = async (next: PipelineTemplateOverrides) => {
+    setPipelineTemplates(next)
+    setPipelineTemplatesSaving(true)
+    try { await window.agentDock?.patchSettings({ pipelineTemplates: next }) } catch {} finally { setPipelineTemplatesSaving(false) }
+  }
 
   const chooseProvider = (id: ProviderId) => {
     limitsRequestId.current += 1
@@ -601,9 +652,96 @@ export default function App() {
     restoreSession(session)
   }
 
-  const sendPrompt = async () => {
+  const deleteSession = async (session: ChatSession) => {
+    if (runId || !window.agentDock) return
+    if (!window.confirm(`Delete session "${session.title}"?\nThe conversation is removed; run artifacts stay on disk.`)) return
+    const ok = await window.agentDock.deleteSession(session.id)
+    if (!ok) return
+    const remaining = sessions.filter((item) => item.id !== session.id)
+    setSessions(remaining)
+    if (session.id === activeSessionId) {
+      if (remaining.length) restoreSession(remaining[0])
+      else await createNewSession()
+    }
+  }
+
+  const focusSessionSearch = () => {
+    setSidebarOpen(true)
+    window.setTimeout(() => sessionSearchRef.current?.focus(), 60)
+  }
+
+  const buildLightContextPrefix = (value: string) => {
+    const conversationMessages = messages.filter((message) => message.id !== 'hello' && !message.pending)
+    const portableContext = contextHandoff
+      ? buildHandoffContext(conversationMessages)
+      : conversationMessages.slice(-8).map((message) => `${message.role === 'user' ? 'User' : providerMeta[message.provider ?? provider].name}: ${message.content}`).join('\n\n')
+    const blocks: string[] = []
+    if (portableContext) blocks.push(contextHandoff
+      ? `<agentdock_session_summary>\nThis is a compact summary of the session so far, produced so the new model/provider can continue effectively:\n\n${portableContext}\n</agentdock_session_summary>`
+      : `Continue from this provider-neutral conversation context:\n\n${portableContext}`)
+    if (gitInfo?.currentBranch) blocks.push(`Active git branch: ${gitInfo.currentBranch}`)
+    if (attachments.length) blocks.push(`Attached files:\n${attachments.map((file) => `- ${file}`).join('\n')}`)
+    return blocks.length ? `<agentdock_context>\n${blocks.join('\n\n')}\n</agentdock_context>\n\n<user_request>\n${value}\n</user_request>` : value
+  }
+
+  const runRaceFlow = async () => {
     const value = prompt.trim()
+    if (!value || runId || raceBusy || councilBusy || !window.agentDock) return
+    setPrompt('')
+    setRaceResult(null)
+    setRaceBusy(true)
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }])
+    try {
+      const contextPrefix = buildLightContextPrefix(value)
+      const gates = buildGatesRequest(orchestration)
+      const result = await window.agentDock.runRace({
+        provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments,
+        profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined,
+        gates: (gates.testCommand || gates.protectedPaths.length) ? gates : undefined,
+        race: {
+          n: orchestration.race.n, review: orchestration.race.review, autoAdopt: orchestration.race.autoAdopt,
+          providers: orchestration.race.providers.length ? orchestration.race.providers : undefined,
+          reviewers: orchestration.race.reviewers, minScore: orchestration.race.minScore,
+        },
+      })
+      setRaceResult(result)
+      setAttachments([])
+      setApprovalRefreshToken((value) => value + 1)
+    } catch (error) {
+      setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'assistant', provider, at: Date.now(), content: error instanceof Error ? error.message : String(error) }])
+    } finally {
+      setRaceBusy(false)
+    }
+  }
+
+  const runCouncilFlow = async () => {
+    const value = prompt.trim()
+    if (!value || runId || raceBusy || councilBusy || !window.agentDock || !activeSessionId) return
+    setPrompt('')
+    setCouncilBusy(true)
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }])
+    try {
+      const contextPrefix = buildLightContextPrefix(value)
+      const result = await window.agentDock.runCouncil({
+        provider, permissionMode, prompt: contextPrefix, workspace, attachments,
+        profileId: profileId ?? undefined, sessionId: activeSessionId,
+        council: { enabled: true, providers: orchestration.council.providers.length ? orchestration.council.providers : undefined },
+      })
+      setAttachments([])
+      setPlanRefreshToken((value) => value + 1)
+      if (result.mergedPlan) setPlanResult({ readiness: result.readiness, openQuestions: result.openQuestions, hash: result.hash, planPath: result.planPath })
+      if (!result.mergedPlan) setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'assistant', provider, at: Date.now(), content: result.reason ? `Council did not produce a merged plan (${result.reason.replace(/_/g, ' ')}).` : 'Council did not produce a merged plan.' }])
+    } catch (error) {
+      setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'assistant', provider, at: Date.now(), content: error instanceof Error ? error.message : String(error) }])
+    } finally {
+      setCouncilBusy(false)
+    }
+  }
+
+  const sendPromptText = async (rawValue: string, overrideIntent?: 'agent' | 'plan' | 'ask') => {
+    const value = rawValue.trim()
     if (!value || runId) return
+    const effectiveIntent = overrideIntent ?? intent
     setPrompt('')
     setRawOutput('')
     const pendingId = crypto.randomUUID()
@@ -645,12 +783,12 @@ export default function App() {
     const contextPrefix = contextBlocks.length
       ? `<agentdock_context>\n${contextBlocks.join('\n\n')}\n</agentdock_context>\n\n<user_request>\n${value}\n</user_request>`
       : value
-      setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: value }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+      setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }, { id: pendingId, role: 'assistant', provider, at: Date.now(), content: '', pending: true }])
     try {
       if (!window.agentDock) throw new Error('Agent execution is available in the Electron app.')
       setTypedEvents([])
       setPlanResult(null)
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined, intent })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined, intent: effectiveIntent, ...buildRunRequestExtras({ ...orchestration, intent: effectiveIntent }) })
       setAttachments([])
       activeRunId.current = result.runId
       setRunId(result.runId)
@@ -662,13 +800,125 @@ export default function App() {
     }
   }
 
+  const runPipelineStep = async (index: number, runState: PipelineRunState) => {
+    const config = pipelineRef.current
+    const step = config.steps[index]
+    if (!step || !window.agentDock) return
+    const fixNotes = runState.fixRounds > 0 && step.role === 'implement'
+      ? [...runState.outputs].reverse().find((output) => output.role === 'verify' && output.verdict === 'fail')?.content ?? ''
+      : ''
+    const fullPrompt = buildStepPrompt(step, runState.request, runState.outputs, fixNotes, pipelineTemplatesRef.current)
+    const label = `⛓ Step ${index + 1}/${config.steps.length} · ${pipelineRoleMeta[step.role].label} — ${providerMeta[step.provider].name} (${step.model})${fixNotes ? ' · fix round' : ''}`
+    // Align global selection with the step so transcript parsing, usage, and lane bookkeeping stay consistent.
+    setProvider(step.provider)
+    setModel(step.model)
+    setReasoning(step.reasoning)
+    setRawOutput('')
+    const pendingId = crypto.randomUUID()
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: label }, { id: pendingId, role: 'assistant', provider: step.provider, at: Date.now(), content: '', pending: true }])
+    setPipelineRun({ ...runState, active: true, stepIndex: index, awaitingContinue: false, nextIndex: null, error: '' })
+    try {
+      const stepProfileId = profiles.some((profile) => profile.id === profileId && profile.provider === step.provider && profile.enabled) ? profileId ?? undefined : undefined
+      const result = await window.agentDock.runAgent({
+        provider: step.provider, model: step.model, reasoning: step.reasoning, agent: 'default', permissionMode,
+        prompt: fullPrompt, workspace, attachments, profileId: stepProfileId,
+        sessionId: activeSessionId ?? undefined, intent: pipelineRoleMeta[step.role].intent,
+      })
+      activeRunId.current = result.runId
+      setRunId(result.runId)
+      lastExitCodeRef.current = null
+      lastLaneRef.current = `${step.provider}:${stepProfileId ?? ''}`
+    } catch (error) {
+      setMessages((items) => items.map((message) => message.id === pendingId ? { ...message, pending: false, content: error instanceof Error ? error.message : String(error) } : message))
+      setPipelineRun((state) => ({ ...state, awaitingContinue: true, nextIndex: index, error: 'Could not start this step — fix the issue and retry.' }))
+    }
+  }
+
+  const startPipeline = (value: string) => {
+    setPrompt('')
+    setTypedEvents([])
+    setPlanResult(null)
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }])
+    const runState: PipelineRunState = { active: true, stepIndex: 0, request: value, outputs: [], fixRounds: 0, awaitingContinue: false, nextIndex: null, error: '' }
+    setPipelineRun(runState)
+    void runPipelineStep(0, runState)
+  }
+
+  const continuePipeline = () => {
+    const state = pipelineRunRef.current
+    if (!state.active || state.nextIndex === null || runId) return
+    void runPipelineStep(state.nextIndex, { ...state, awaitingContinue: false, error: '' })
+  }
+
+  const stopPipeline = () => {
+    if (runId) void window.agentDock?.stopAgent(runId)
+    setPipelineRun((state) => ({ ...state, active: false, awaitingContinue: false, nextIndex: null }))
+  }
+
+  const advancePipeline = (content: string, exitCode: number | null) => {
+    const state = pipelineRunRef.current
+    const config = pipelineRef.current
+    if (!state.active) return
+    const step = config.steps[state.stepIndex]
+    if (!step) { setPipelineRun({ ...state, active: false }); return }
+    const verdict = step.role === 'verify' ? parseVerdict(content) : undefined
+    const outputs = [...state.outputs, { stepId: step.id, role: step.role, provider: step.provider, model: step.model, content, verdict }]
+    const finish = (error = '') => {
+      setPipelineRun({ ...state, outputs, active: false, awaitingContinue: false, nextIndex: null, error: '' })
+      setAttachments([])
+      const summary = error
+        ? `⛓ Pipeline stopped — ${error}`
+        : `⛓ Pipeline finished — ${config.steps.length} ${config.steps.length === 1 ? 'step' : 'steps'} completed${state.fixRounds ? ` after ${state.fixRounds} fix ${state.fixRounds === 1 ? 'round' : 'rounds'}` : ''}.`
+      setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'assistant', provider: step.provider, at: Date.now(), content: summary }])
+    }
+    if (exitCode !== null && exitCode !== 0) {
+      setPipelineRun({ ...state, outputs, awaitingContinue: true, nextIndex: state.stepIndex, error: `Step ${state.stepIndex + 1} exited with code ${exitCode}. Retry, or stop the pipeline.` })
+      return
+    }
+    let nextIndex: number
+    let fixRounds = state.fixRounds
+    if (verdict === 'fail') {
+      const implementIndex = config.steps.slice(0, state.stepIndex).reduce((found, item, itemIndex) => item.role === 'implement' ? itemIndex : found, -1)
+      if (implementIndex >= 0 && fixRounds < config.maxFixRounds) {
+        fixRounds += 1
+        nextIndex = implementIndex
+      } else {
+        finish(`verifier still reports FAIL after ${fixRounds} fix ${fixRounds === 1 ? 'round' : 'rounds'}.`)
+        return
+      }
+    } else if (state.stepIndex + 1 < config.steps.length) {
+      nextIndex = state.stepIndex + 1
+    } else {
+      finish()
+      return
+    }
+    const nextState: PipelineRunState = { ...state, outputs, fixRounds, stepIndex: nextIndex, awaitingContinue: !config.autopilot, nextIndex, error: '' }
+    setPipelineRun(nextState)
+    if (config.autopilot) window.setTimeout(() => void runPipelineStep(nextIndex, nextState), 400)
+  }
+
+  const pipelineReady = pipeline.enabled && pipeline.steps.length > 0 && validatePipeline(pipeline, installed).length === 0
+
+  const sendPrompt = () => {
+    if (pipelineReady) {
+      const value = prompt.trim()
+      if (value && !runId && !pipelineRun.active) startPipeline(value)
+      return
+    }
+    if (orchestration.council.enabled) return void runCouncilFlow()
+    if (orchestration.race.enabled) return void runRaceFlow()
+    void sendPromptText(prompt)
+  }
+
+  const implementPlan = (text: string) => { void sendPromptText(text, 'agent') }
+
   const restartAgent = async () => {
     if (runId || !window.agentDock) return
     setPrompt('')
     setRawOutput('')
     const pendingId = crypto.randomUUID()
     const restartPrompt = lastPrompt || 'Continue working on the current task.'
-    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Restarting agent: ${restartPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: `Restarting agent: ${restartPrompt}` }, { id: pendingId, role: 'assistant', provider, at: Date.now(), content: '', pending: true }])
     try {
       const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: restartPrompt, workspace, attachments, mode: 'restart', profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
       activeRunId.current = result.runId
@@ -684,7 +934,7 @@ export default function App() {
     setPrompt('')
     setRawOutput('')
     const pendingId = crypto.randomUUID()
-    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: 'Resume saved CLI session' }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: 'Resume saved CLI session' }, { id: pendingId, role: 'assistant', provider, at: Date.now(), content: '', pending: true }])
     try {
       const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: '', workspace, attachments, mode: 'resume', cliSessionId, lastPrompt, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
       activeRunId.current = result.runId
@@ -702,7 +952,7 @@ export default function App() {
     setRawOutput('')
     const pendingId = crypto.randomUUID()
     const retryPrompt = lastPrompt || 'Retry the last action.'
-    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Retry: ${retryPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: `Retry: ${retryPrompt}` }, { id: pendingId, role: 'assistant', provider, at: Date.now(), content: '', pending: true }])
     try {
       const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: retryPrompt, workspace, attachments, mode: 'retry', profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
       activeRunId.current = result.runId
@@ -741,8 +991,10 @@ export default function App() {
 
   const title = useMemo(() => nav.find((item) => item.id === view)?.label ?? 'Settings', [view])
   const projectGroups = useMemo(() => {
+    const needle = sessionQuery.trim().toLowerCase()
     const groups = new Map<string, ChatSession[]>()
     for (const session of sessions) {
+      if (needle && !session.title.toLowerCase().includes(needle) && !workspaceName(session.workspace).toLowerCase().includes(needle)) continue
       const group = groups.get(session.workspace) ?? []
       group.push(session)
       groups.set(session.workspace, group)
@@ -753,7 +1005,7 @@ export default function App() {
       sessions: projectSessions.sort((a, b) => b.updatedAt - a.updatedAt),
       updatedAt: Math.max(...projectSessions.map((session) => session.updatedAt)),
     })).sort((a, b) => b.updatedAt - a.updatedAt)
-  }, [sessions])
+  }, [sessions, sessionQuery])
 
   return <div className="app-shell">
     <header className="titlebar">
@@ -770,22 +1022,27 @@ export default function App() {
         <nav className="main-nav">
           <div className="nav-caption">SYSTEM</div>
           {nav.map((item) => <button key={item.id} className={`nav-item ${view === item.id ? 'active' : ''}`} onClick={() => setView(item.id)}>
-            <item.icon size={17} /><span>{item.label}</span>{item.id === 'mcp' && <span className="count">{mcpServers.length}</span>}
+            <item.icon size={17} /><span>{item.label}</span>{item.id === 'mcp-manager' && mcpServers.length > 0 && <span className="count">{mcpServers.length}</span>}
           </button>)}
         </nav>
         <div className="session-list">
           <div className="nav-caption row">PROJECTS <button onClick={() => void chooseWorkspace()} disabled={Boolean(runId)} aria-label="Add project"><Plus size={14} /></button></div>
+          <div className="session-search"><Search size={12} /><input ref={sessionSearchRef} value={sessionQuery} onChange={(e) => setSessionQuery(e.target.value)} placeholder="Search sessions" onKeyDown={(e) => { if (e.key === 'Escape') { setSessionQuery(''); (e.target as HTMLInputElement).blur() } }} />{sessionQuery && <button onClick={() => setSessionQuery('')} aria-label="Clear search"><X size={11} /></button>}</div>
           {!sessionsReady && <div className="sessions-empty">Loading sessions…</div>}
-          {sessionsReady && !projectGroups.length && <div className="sessions-empty">No projects yet</div>}
+          {sessionsReady && !projectGroups.length && <div className="sessions-empty">{sessionQuery ? 'No sessions match this search' : 'No projects yet'}</div>}
           {projectGroups.map((project) => {
-            const collapsed = collapsedProjects.includes(project.path)
+            const collapsed = collapsedProjects.includes(project.path) && !sessionQuery
             return <div className="project-group" key={project.path}>
               <button className="project-row" onClick={() => setCollapsedProjects((items) => items.includes(project.path) ? items.filter((item) => item !== project.path) : [...items, project.path])} title={project.path}>
                 {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}<Folder size={14} /><strong>{project.name}</strong><span>{project.sessions.length}</span>
               </button>
-              {!collapsed && <div className="project-sessions">{project.sessions.map((session) => <button key={session.id} className={`session ${session.id === activeSessionId ? 'active' : ''}`} onClick={() => selectSession(session)} disabled={Boolean(runId) && session.id !== activeSessionId}>
-                <strong>{session.title}</strong><small>{relativeTime(session.updatedAt)}</small>
-              </button>)}</div>}
+              {!collapsed && <div className="project-sessions">{project.sessions.map((session) => {
+                const disabled = Boolean(runId) && session.id !== activeSessionId
+                return <div key={session.id} className={`session ${session.id === activeSessionId ? 'active' : ''} ${disabled ? 'disabled' : ''}`} onClick={() => { if (!disabled) selectSession(session) }} role="button" tabIndex={disabled ? -1 : 0} onKeyDown={(e) => { if (!disabled && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); selectSession(session) } }}>
+                  <strong>{session.title}</strong><small>{relativeTime(session.updatedAt)}</small>
+                  <button className="session-delete" onClick={(e) => { e.stopPropagation(); void deleteSession(session) }} disabled={Boolean(runId)} title="Delete session" aria-label={`Delete session ${session.title}`}><Trash2 size={12} /></button>
+                </div>
+              })}</div>}
             </div>
           })}
         </div>
@@ -802,18 +1059,26 @@ export default function App() {
           <div className="toolbar-title"><span>{title}</span>{view === 'chat' && <><ChevronRight size={14} /><strong>{sessionTitle(messages)}</strong></>}</div>
           <div className="toolbar-spacer" />
           {view === 'chat' && <button className="workspace-picker" onClick={chooseWorkspace} disabled={Boolean(runId)} title="Start a session in another project"><Folder size={14} /><span>{workspaceName(workspace)}</span><ChevronDown size={13} /></button>}
-          <button className="icon-button"><Search size={17} /></button>
+          <button className="icon-button" onClick={focusSessionSearch} title="Search sessions" aria-label="Search sessions"><Search size={17} /></button>
           <MoreMenuTrigger open={moreMenuOpen} onClick={() => setMoreMenuOpen(!moreMenuOpen)} />
           <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} canRestart={view === 'chat' && !runId} canResume={view === 'chat' && !runId && Boolean(cliSessionId)} canRetry={view === 'chat' && !runId && lastRunFailed} onRestart={() => { setMoreMenuOpen(false); void restartAgent() }} onResume={() => { setMoreMenuOpen(false); void resumeSession() }} onRetry={() => { setMoreMenuOpen(false); void retryLastAction() }} />
         </div>
 
-        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null), typedEvents, intent, setIntent, planResult }} sessionTitle={sessionTitle(messages)} />}
+        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null), typedEvents, intent, setIntent, planResult }} sessionTitle={sessionTitle(messages)}
+          sessionId={activeSessionId} workspace={workspace} orchestration={orchestration} setOrchestration={setOrchestration} onOrchestrationValidityChange={setOrchestrationValid} orchestrationValid={orchestrationValid}
+          planRefreshToken={planRefreshToken} onImplementPlan={implementPlan} onRePlan={() => setIntent('plan')}
+          raceResult={raceResult} raceBusy={raceBusy} councilBusy={councilBusy} onDismissRace={() => setRaceResult(null)}
+          onAnswerQuestions={(text) => void sendPromptText(text)}
+          pipeline={pipeline} onPipelineChange={setPipeline} pipelineRun={pipelineRun}
+          onPipelineContinue={continuePipeline} onPipelineStop={stopPipeline}
+          pipelineTemplates={pipelineTemplates} onPipelineTemplatesChange={(next) => void savePipelineTemplates(next)} pipelineTemplatesSaving={pipelineTemplatesSaving}
+          onCandidateAdopted={() => { setApprovalRefreshToken((value) => value + 1); void refreshGitInfo() }}
+        />}
         {view === 'providers' && <ProvidersView installed={installed} runtime={runtime} />}
         {view === 'profiles' && <ProfilesView />}
-        {view === 'mcp' && <McpView servers={mcpServers} />}
-        {view === 'mcp-manager' && <McpManagerView workspace={workspace} />}
+        {view === 'mcp-manager' && <McpManagerView workspace={workspace} cliServers={mcpServers} onRefreshCli={refreshCliServers} />}
         {view === 'skills' && <SkillsView workspace={workspace} />}
-        {view === 'runs' && <RunsView sessionId={activeSessionId} />}
+        {view === 'runs' && <RunsView sessionId={activeSessionId} activeRunId={runId} approvalRefreshToken={approvalRefreshToken} onApprovalResolved={() => setApprovalRefreshToken((value) => value + 1)} />}
         {view === 'settings' && <SettingsView workspace={workspace} contextHandoff={contextHandoff} onContextHandoffChange={async (enabled) => { setContextHandoff(enabled); try { await window.agentDock?.patchSettings({ contextHandoff: enabled }) } catch {} }} limitAction={limitAction} onLimitActionChange={async (action) => { setLimitAction(action); try { await window.agentDock?.patchSettings({ limitAction: action }) } catch {} }} />}
         <div ref={messagesEnd} />
         </main>
@@ -840,6 +1105,15 @@ function ChatView(props: {
   typedEvents: Array<Record<string, unknown> & { type: string }>;
   intent: 'agent' | 'plan' | 'ask'; setIntent: (value: 'agent' | 'plan' | 'ask') => void;
   planResult: PlanResult | null;
+  sessionId: string | null; workspace: string;
+  orchestration: OrchestrationConfig; setOrchestration: (value: OrchestrationConfig) => void; onOrchestrationValidityChange: (valid: boolean) => void; orchestrationValid: boolean;
+  planRefreshToken: number; onImplementPlan: (prompt: string) => void; onRePlan: () => void;
+  raceResult: RaceResultView | null; raceBusy: boolean; councilBusy: boolean; onDismissRace: () => void;
+  onCandidateAdopted: (candidateId: string) => void;
+  onAnswerQuestions: (text: string) => void;
+  pipeline: PipelineConfig; onPipelineChange: (config: PipelineConfig) => void; pipelineRun: PipelineRunState;
+  onPipelineContinue: () => void; onPipelineStop: () => void;
+  pipelineTemplates: PipelineTemplateOverrides; onPipelineTemplatesChange: (templates: PipelineTemplateOverrides) => void; pipelineTemplatesSaving: boolean;
 }) {
   const meta = providerMeta[props.provider]
   const models = props.runtime[props.provider].models
@@ -867,28 +1141,33 @@ function ChatView(props: {
 
       {props.rotationNotice && <div className="rotation-banner"><RefreshCw size={14} /><div><strong>Profile rotated</strong><p>Quota exhausted on <code>{props.profiles.find((p) => p.id === props.rotationNotice!.from)?.name ?? props.rotationNotice!.from}</code>. Switch to <code>{props.profiles.find((p) => p.id === props.rotationNotice!.to)?.name ?? props.rotationNotice!.to}</code> for the next run.</p></div><button onClick={props.onDismissRotation}><X size={14} /></button></div>}
 
-      {props.planResult && !props.runId && <div className="plan-result-panel">
-        <div className="plan-result-head"><BrainCircuit size={16} /><strong>Plan readiness: <span className={`plan-readiness plan-readiness-${props.planResult.readiness}`}>{props.planResult.readiness.replace(/_/g, ' ')}</span></strong><span className="plan-hash">{props.planResult.hash}</span></div>
-        {props.planResult.openQuestions.length > 0 && <div className="plan-questions">
-          <div className="plan-questions-title">Open questions ({props.planResult.openQuestions.length})</div>
-          {props.planResult.openQuestions.map((q) => <div key={q.id} className="plan-question"><span className={`plan-question-kind plan-question-${q.kind}`}>{q.kind}</span><span>{q.text}</span></div>)}
-        </div>}
+      {props.sessionId && !props.runId && <PlanPanel sessionId={props.sessionId} provider={props.provider} runId={props.runId} refreshToken={props.planRefreshToken} onImplement={props.onImplementPlan} onRePlan={props.onRePlan} />}
+
+      {props.raceResult && <div className="race-result-wrap">
+        <div className="race-result-head"><span>Best-of-N race result</span><button onClick={props.onDismissRace}><X size={13} /></button></div>
+        <CompareView result={props.raceResult} sessionId={props.sessionId ?? ''} onAdopted={props.onCandidateAdopted} />
       </div>}
 
       <div className="messages">
-        {props.messages.map((message) => <article key={message.id} className={`message ${message.role}`}>
-          <div className="message-avatar">{message.role === 'user' ? 'JD' : <BrainCircuit size={17} />}</div>
-          <div className="message-body">
-            <div className="message-meta"><strong>{message.role === 'user' ? 'You' : providerMeta[message.provider ?? props.provider].name}</strong><span>now</span>{message.provider && <em>{providerMeta[message.provider].badge}</em>}{!message.pending && message.id === lastAssistantId && currentOutcome && <span className="outcome-badge" data-outcome={currentOutcome}>{currentOutcome}</span>}</div>
-            {message.pending ? <>
-              <div className="agent-started"><span className="running-dot" />{meta.name} начал работу…</div>
-              {liveTranscript.activities.length ? <ActivityFeed activities={liveTranscript.activities} live /> : null}
-            </> : message.role === 'assistant' && message.id !== 'hello' ? <>
-              {message.activities?.length ? <ActivityFeed activities={message.activities} /> : null}
-              <FinalSummary content={message.content} files={message.files ?? []} />
-            </> : <p>{message.content}</p>}
-          </div>
-        </article>)}
+        {props.messages.map((message, index) => {
+          const isLastMessage = index === props.messages.length - 1
+          return <article key={message.id} className={`message ${message.role}`}>
+            <div className="message-avatar">{message.role === 'user' ? 'JD' : <BrainCircuit size={17} />}</div>
+            <div className="message-body">
+              <div className="message-meta"><strong>{message.role === 'user' ? 'You' : providerMeta[message.provider ?? props.provider].name}</strong><span>{message.at ? timeLabel(message.at) : ''}</span>{message.provider && <em>{providerMeta[message.provider].badge}</em>}{!message.pending && message.id === lastAssistantId && currentOutcome && <span className="outcome-badge" data-outcome={currentOutcome}>{currentOutcome}</span>}</div>
+              {message.pending ? <>
+                <WorkingIndicator name={meta.name} startedAt={message.at} />
+                {liveTranscript.timeline.length ? <ActivityFeed activities={liveTranscript.timeline} live /> : null}
+                {liveTranscript.content ? <div className="live-answer"><p>{liveTranscript.content}</p><span className="live-caret" /></div> : null}
+              </> : message.role === 'assistant' && message.id !== 'hello' ? <>
+                {message.activities?.length ? <ActivityFeed activities={message.activities} /> : null}
+                <FinalSummary content={message.content} files={message.files ?? []} />
+                {isLastMessage && !props.runId && !props.planResult?.openQuestions?.length &&
+                  <QuestionPrompt content={message.content} disabled={Boolean(props.runId) || props.raceBusy || props.councilBusy} onSubmit={props.onAnswerQuestions} />}
+              </> : <p>{message.content}</p>}
+            </div>
+          </article>
+        })}
       </div>
     </div>
 
@@ -911,6 +1190,12 @@ function ChatView(props: {
     </div>}
 
     <div className="composer-wrap">
+      <div className="composer-panels">
+        <OrchestrationControls workspace={props.workspace} installed={props.installed} intent={props.intent} config={props.orchestration} onChange={props.setOrchestration} onValidityChange={props.onOrchestrationValidityChange} />
+        <PipelinePanel workspace={props.workspace} installed={props.installed} runtime={props.runtime} config={props.pipeline} onChange={props.onPipelineChange} busy={Boolean(props.runId) || props.pipelineRun.active} templates={props.pipelineTemplates} onTemplatesChange={props.onPipelineTemplatesChange} templatesSaving={props.pipelineTemplatesSaving} />
+      </div>
+      <PipelineStrip config={props.pipeline} run={props.pipelineRun} onContinue={props.onPipelineContinue} onStop={props.onPipelineStop} />
+      {(props.raceBusy || props.councilBusy) && <div className="orchestration-busy"><RefreshCw className="spin" size={13} /> {props.raceBusy ? `Racing ${props.orchestration.race.n} candidates…` : 'Council drafting in parallel…'}</div>}
       <div className="composer">
         {props.attachments.length > 0 && <div className="attachment-list">{props.attachments.map((file) => <span key={file}><Paperclip size={11} />{file.split(/[\\/]/).pop()}<button onClick={() => props.setAttachments((items) => items.filter((item) => item !== file))}><X size={11} /></button></span>)}</div>}
         <textarea value={props.prompt} onChange={(e) => props.setPrompt(e.target.value)} placeholder="Ask the agent to build, explain, or change something…" onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); props.sendPrompt() } }} />
@@ -951,35 +1236,75 @@ function ChatView(props: {
             <button className={`tool-pill intent-pill ${props.intent !== 'agent' ? 'active' : ''}`} onClick={() => props.setIntent(props.intent === 'agent' ? 'plan' : 'agent')} disabled={Boolean(props.runId)} title="Toggle plan mode (read-only, no file changes)"><BrainCircuit size={14} /> {props.intent === 'plan' ? 'Plan' : props.intent === 'ask' ? 'Ask' : 'Agent'}</button>
             {props.intent !== 'agent' && <button className="tool-pill intent-sub" onClick={() => props.setIntent(props.intent === 'plan' ? 'ask' : 'plan')} disabled={Boolean(props.runId)} title="Switch between plan and ask">{props.intent === 'plan' ? '→ Ask' : '→ Plan'}</button>}
           </div>
-          {props.runId ? <button className="send-button stop" onClick={() => window.agentDock?.stopAgent(props.runId!)}><CircleStop size={17} /></button> : <button className="send-button" onClick={props.sendPrompt} disabled={!props.prompt.trim()}><Send size={17} /></button>}
+          {props.runId ? <button className="send-button stop" onClick={() => window.agentDock?.stopAgent(props.runId!)}><CircleStop size={17} /></button> : <button className="send-button" onClick={props.sendPrompt} disabled={!props.prompt.trim() || props.raceBusy || props.councilBusy || props.pipelineRun.active || (props.pipeline.enabled && validatePipeline(props.pipeline, props.installed).length > 0) || ((props.orchestration.race.enabled || props.orchestration.council.enabled) && !props.orchestrationValid)}><Send size={17} /></button>}
         </div>
       </div>
-      <div className="composer-hint"><span>Enter to send · Shift + Enter for new line</span><span>Context is portable across providers</span></div>
+      <div className="composer-hint"><span>{props.pipeline.enabled && props.pipeline.steps.length ? `Enter starts the ${props.pipeline.steps.length}-step pipeline` : 'Enter to send · Shift + Enter for new line'}</span><span>Context is portable across providers</span></div>
     </div>
   </section>
 }
 
+function timeLabel(timestamp: number) {
+  return new Date(timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+}
+
+function WorkingIndicator({ name, startedAt }: { name: string; startedAt?: number }) {
+  const [, forceTick] = useState(0)
+  useEffect(() => {
+    const timer = window.setInterval(() => forceTick((value) => value + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const elapsed = startedAt ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : null
+  const elapsedLabel = elapsed === null ? '' : elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
+  return <div className="agent-started"><span className="running-dot" />{name} is working…{elapsedLabel && <span className="agent-elapsed">{elapsedLabel}</span>}</div>
+}
+
 function ActivityFeed({ activities, live = false }: { activities: AgentActivity[]; live?: boolean }) {
-  const reasoning = activities.filter((activity) => activity.type === 'thinking')
-  const actions = activities.filter((activity) => activity.type !== 'thinking')
+  const steps = activities.length
+  const edits = activities.filter((activity) => activity.type === 'files').length
   return <div className={`activity-feed ${live ? 'live' : ''}`}>
-    {reasoning.length ? <details className="activity-group reasoning" open={live}>
-      <summary><span className="activity-icon"><BrainCircuit size={14} /></span><strong>Reasoning</strong><span className="activity-count">{reasoning.length}</span><span className="activity-spacer" /><ChevronRight className="activity-chevron" size={14} /></summary>
-      <div className="reasoning-list">{reasoning.map((item) => <p key={item.id}>{item.detail}</p>)}</div>
-    </details> : null}
-    {actions.length ? <details className="activity-group actions" open={live}>
-      <summary><span className="activity-icon"><TerminalSquare size={14} /></span><strong>Actions</strong><span className="activity-count">{actions.length}</span><span className="activity-spacer" /><ChevronRight className="activity-chevron" size={14} /></summary>
-      <div className="action-list">{actions.map((activity) => <ActionRow activity={activity} key={activity.id} />)}</div>
-    </details> : null}
+    <details className="activity-group timeline" open={live}>
+      <summary>
+        <span className="activity-icon"><TerminalSquare size={14} /></span>
+        <strong>Activity</strong>
+        <span className="activity-count">{steps} {steps === 1 ? 'step' : 'steps'}</span>
+        {edits > 0 && <span className="activity-count edits">{edits} {edits === 1 ? 'edit' : 'edits'}</span>}
+        <span className="activity-spacer" />
+        {live && <RefreshCw className="spin activity-live-spin" size={13} />}
+        <ChevronRight className="activity-chevron" size={14} />
+      </summary>
+      <div className="action-list">{activities.map((activity, index) => {
+        if (activity.type === 'thinking') return <ThinkingRow activity={activity} key={activity.id} />
+        if (activity.type === 'message') return <NoteRow activity={activity} key={activity.id} />
+        return <ActionRow activity={activity} key={activity.id} running={live && index === activities.length - 1 && (activity.status === 'running' || activity.status === 'in_progress' || activity.status === 'pending')} />
+      })}</div>
+    </details>
   </div>
 }
 
-function ActionRow({ activity }: { activity: AgentActivity }) {
+function ThinkingRow({ activity }: { activity: AgentActivity }) {
+  const text = (activity.detail || '').trim()
+  if (!text) return null
+  const preview = text.replace(/\s+/g, ' ').slice(0, 96)
+  return <details className="action-row thinking">
+    <summary><span className="action-kind"><BrainCircuit size={13} /></span><strong>Reasoning</strong><span className="action-target">{preview}{text.length > 96 ? '…' : ''}</span><span className="activity-spacer" /><ChevronRight className="activity-chevron" size={13} /></summary>
+    <div className="action-content"><pre className="thinking-text">{text}</pre></div>
+  </details>
+}
+
+function NoteRow({ activity }: { activity: AgentActivity }) {
+  const text = (activity.detail || '').trim()
+  if (!text) return null
+  return <div className="action-row note"><span className="action-kind"><MessageSquareText size={13} /></span><p className="note-text">{text}</p></div>
+}
+
+function ActionRow({ activity, running = false }: { activity: AgentActivity; running?: boolean }) {
   const changed = activity.type === 'files'
   const description = describeActivity(activity)
   const additions = changed ? activity.files?.reduce((sum, file) => sum + file.additions, 0) ?? 0 : 0
   const deletions = changed ? activity.files?.reduce((sum, file) => sum + file.deletions, 0) ?? 0 : 0
   const expandable = Boolean(activity.detail || activity.output || activity.files?.some((file) => file.diff))
+  const trailing = running ? <RefreshCw className="spin activity-live-spin" size={12} /> : changed ? <span className="activity-totals"><i>+{additions}</i><b>-{deletions}</b></span> : null
   const ActivityIcon = description.kind === 'read' ? FileText
     : description.kind === 'search' ? Search
       : description.kind === 'list' ? Folder
@@ -993,26 +1318,83 @@ function ActionRow({ activity }: { activity: AgentActivity }) {
     {activity.output ? <pre className="activity-output">{activity.output}</pre> : null}
     {activity.files?.map((file) => <div className="action-file" key={file.path}>
       <div><span>{file.path}</span><i>+{file.additions}</i><b>-{file.deletions}</b></div>
-      {file.diff ? <pre className="file-diff">{file.diff}</pre> : null}
+      {file.diff ? <DiffView diff={file.diff} /> : null}
     </div>)}
   </>
-  if (!expandable) return <div className={`action-row ${description.kind}`}>{heading}<span className="activity-spacer" />{changed ? <span className="activity-totals"><i>+{additions}</i><b>-{deletions}</b></span> : null}</div>
+  if (!expandable) return <div className={`action-row ${description.kind}`}>{heading}<span className="activity-spacer" />{trailing}</div>
   return <details className={`action-row ${description.kind}`}>
-    <summary>{heading}<span className="activity-spacer" />{changed ? <span className="activity-totals"><i>+{additions}</i><b>-{deletions}</b></span> : null}<ChevronRight className="activity-chevron" size={13} /></summary>
+    <summary>{heading}<span className="activity-spacer" />{trailing}<ChevronRight className="activity-chevron" size={13} /></summary>
     <div className="action-content">{content}</div>
   </details>
+}
+
+function extractQuestions(content: string): string[] {
+  const questions: string[] = []
+  for (const line of content.split(/\r?\n/)) {
+    const text = line.trim().replace(/^(?:[-*•>]|\d+[.)])\s+/, '').trim()
+    if (/\?\s*$/.test(text) && text.length > 8 && !questions.includes(text)) questions.push(text)
+  }
+  if (!questions.length) {
+    const trimmed = content.trim()
+    if (/\?\s*$/.test(trimmed)) {
+      const lastSentence = trimmed.split(/(?<=[.!?])\s+/).at(-1)?.trim()
+      if (lastSentence && lastSentence.endsWith('?') && lastSentence.length > 8) questions.push(lastSentence)
+    }
+  }
+  return questions.slice(0, 6)
+}
+
+function QuestionPrompt({ content, disabled, onSubmit }: { content: string; disabled: boolean; onSubmit: (text: string) => void }) {
+  const questions = useMemo(() => extractQuestions(content), [content])
+  const [answers, setAnswers] = useState<string[]>([])
+  const [dismissed, setDismissed] = useState(false)
+  useEffect(() => { setAnswers(questions.map(() => '')); setDismissed(false) }, [content])
+  if (!questions.length || dismissed) return null
+  const filled = answers.filter((answer) => answer.trim()).length
+  const submit = () => {
+    const blocks = questions
+      .map((question, index) => ({ question, answer: answers[index]?.trim() ?? '' }))
+      .filter((entry) => entry.answer)
+      .map((entry, index) => `${index + 1}. ${entry.question}\n   → ${entry.answer}`)
+    if (!blocks.length) return
+    onSubmit(`Answers to your questions:\n\n${blocks.join('\n\n')}`)
+  }
+  return <div className="question-prompt">
+    <div className="question-prompt-head">
+      <MessageSquareText size={14} />
+      <strong>The agent asked {questions.length === 1 ? 'a question' : `${questions.length} questions`}</strong>
+      <span className="activity-spacer" />
+      <button className="question-dismiss" onClick={() => setDismissed(true)} aria-label="Dismiss questions"><X size={13} /></button>
+    </div>
+    {questions.map((question, index) => <div className="question-row" key={index}>
+      <div className="question-text">{question}</div>
+      <textarea
+        value={answers[index] ?? ''}
+        onChange={(e) => setAnswers((current) => current.map((item, i) => i === index ? e.target.value : item))}
+        placeholder="Your answer…"
+        disabled={disabled}
+        rows={1}
+        onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit() } }}
+      />
+    </div>)}
+    <div className="question-actions">
+      <button className="question-send" onClick={submit} disabled={disabled || !filled}><Send size={13} /> Send {filled > 1 ? `${filled} answers` : 'answer'}</button>
+      <small>Ctrl + Enter to send · or reply in the composer below</small>
+    </div>
+  </div>
 }
 
 function FinalSummary({ content, files }: { content: string; files: FileChangeSummary[] }) {
   const additions = files.reduce((sum, file) => sum + file.additions, 0)
   const deletions = files.reduce((sum, file) => sum + file.deletions, 0)
+  const noResponse = /^The agent finished without a text response\.?$/.test(content.trim())
   return <div className="final-summary">
-    <div className="summary-label">Summary</div>
-    <p>{content}</p>
+    <div className="summary-label"><Check size={11} /> Result</div>
+    {noResponse ? <p className="summary-empty">{content}</p> : <Markdown content={content} />}
     {files.length ? <details className="final-files" open>
-      <summary><span className="activity-icon"><FileDiff size={14} /></span><strong>Изменено файлов: {files.length}</strong><span className="activity-spacer" /><span className="activity-totals"><i>+{additions}</i><b>-{deletions}</b></span><ChevronRight className="activity-chevron" size={14} /></summary>
+      <summary><span className="activity-icon"><FileDiff size={14} /></span><strong>{files.length} {files.length === 1 ? 'file changed' : 'files changed'}</strong><span className="activity-spacer" /><span className="activity-totals"><i>+{additions}</i><b>-{deletions}</b></span><ChevronRight className="activity-chevron" size={14} /></summary>
       <div className="final-file-list">{files.map((file) => file.diff ? <details className="final-file" key={file.path}>
-        <summary><span>{file.path}</span><i>+{file.additions}</i><b>-{file.deletions}</b><ChevronRight className="activity-chevron" size={13} /></summary><pre className="file-diff">{file.diff}</pre>
+        <summary><span>{file.path}</span><i>+{file.additions}</i><b>-{file.deletions}</b><ChevronRight className="activity-chevron" size={13} /></summary><DiffView diff={file.diff!} />
       </details> : <div className="final-file" key={file.path}><span>{file.path}</span><i>+{file.additions}</i><b>-{file.deletions}</b></div>)}</div>
     </details> : null}
   </div>
@@ -1091,13 +1473,6 @@ function ProvidersView({ installed, runtime }: { installed: Record<ProviderId, b
       <div className="card-footer"><span title={runtime[id].path ?? undefined}><TerminalSquare size={14} /> {runtime[id].version ?? id}</span><button onClick={() => window.agentDock?.configureProvider(id)} disabled={!installed[id]}>Configure <ChevronRight size={14} /></button></div>
     </div>)}</div>
     <InfoStrip icon={<Sparkles size={18} />} title="Portable sessions" text="AgentDock keeps a provider-neutral transcript, so the next engine can continue with the same project context." />
-  </Page>
-}
-
-function McpView({ servers }: { servers: McpServerInfo[] }) {
-  return <Page title="MCP servers" subtitle="Servers reported by the MCP configuration of each installed CLI.">
-    <div className="list-card">{servers.length ? servers.map((server) => <div className="integration-row" key={server.name}><span className="integration-icon" style={{ background: '#a9e57418', color: '#a9e574' }}><PlugZap size={18} /></span><span className="integration-info"><strong>{server.name}</strong><small>{server.detail || 'Configured MCP server'}</small></span><span className="tool-count">{server.providers.join(' · ')}</span><span className={`status ${server.enabled ? 'ok' : ''}`}>{server.enabled ? 'Enabled' : 'Unavailable'}</span><button className="icon-button" onClick={() => window.agentDock?.configureProvider(server.providers[0])} aria-label={`Configure ${server.name}`}><Settings size={16} /></button></div>) : <div className="empty-state">No MCP servers were reported by the installed CLIs.</div>}</div>
-    <InfoStrip icon={<Wrench size={18} />} title="No synthetic entries" text="This list is read from Codex, Claude Code, and OpenCode. Proxies such as Headroom are not shown as MCP servers." />
   </Page>
 }
 
@@ -1205,53 +1580,35 @@ function SkillsView({ workspace }: { workspace: string }) {
   </Page>
 }
 
-function RunsView({ sessionId }: { sessionId: string | null }) {
+function RunsView({ sessionId, activeRunId, approvalRefreshToken, onApprovalResolved }: { sessionId: string | null; activeRunId: string | null; approvalRefreshToken: number; onApprovalResolved: () => void }) {
   const [runs, setRuns] = useState<RunReceipt[]>([])
   const [selected, setSelected] = useState<RunReceipt | null>(null)
-  const [artifact, setArtifact] = useState<string | null>(null)
-  const [artifactPath, setArtifactPath] = useState<string>('final/summary.md')
 
-  useEffect(() => {
+  const refresh = () => {
     if (!sessionId) { setRuns([]); return }
     window.agentDock?.listRuns(sessionId).then(setRuns).catch(() => setRuns([]))
-  }, [sessionId])
+  }
 
-  useEffect(() => {
-    if (!selected) { setArtifact(null); return }
-    window.agentDock?.readRunArtifact(selected.runId, artifactPath).then(setArtifact).catch(() => setArtifact(null))
-  }, [selected, artifactPath])
+  useEffect(refresh, [sessionId, approvalRefreshToken])
 
   return <Page title="Run artifacts" subtitle="Each run writes files — events.jsonl, patch.diff, summary.md, receipt.json. Files are the source of truth.">
+    <ApprovalInbox sessionId={sessionId} refreshToken={approvalRefreshToken} />
     <div className="runs-layout">
       <div className="runs-list">
-        {runs.length === 0 && <div className="skills-message">No runs recorded yet for this session.</div>}
-        {runs.map((run) => (
-          <button key={run.runId} className={`run-item ${selected?.runId === run.runId ? 'active' : ''}`} onClick={() => { setSelected(run); setArtifactPath('final/summary.md') }}>
-            <div className="run-item-header">
-              <span className="run-outcome" data-outcome={run.outcome}>{run.outcome}</span>
-              <span className="run-provider">{providerMeta[run.provider as ProviderId]?.name || run.provider}</span>
-            </div>
-            <div className="run-item-prompt">{run.prompt.slice(0, 100) || run.mode}</div>
-            <div className="run-item-meta">
-              <span>{run.filesChanged.length} files</span>
-              <span>{relativeTime(run.finishedAt)}</span>
-            </div>
-          </button>
-        ))}
+        <RunTree
+          runs={runs}
+          selectedRunId={selected?.runId}
+          onSelect={setSelected}
+          activeRunId={activeRunId}
+          onStopTree={(rootRunId, childIds) => {
+            void window.agentDock?.stopAgent(rootRunId)
+            for (const childId of childIds) void window.agentDock?.stopAgent(childId)
+            onApprovalResolved()
+          }}
+        />
       </div>
       <div className="runs-detail">
-        {selected ? (
-          <>
-            <div className="runs-artifact-tabs">
-              <button className={artifactPath === 'final/summary.md' ? 'active' : ''} onClick={() => setArtifactPath('final/summary.md')}>summary.md</button>
-              <button className={artifactPath === 'final/patch.diff' ? 'active' : ''} onClick={() => setArtifactPath('final/patch.diff')}>patch.diff</button>
-              <button className={artifactPath === 'events.jsonl' ? 'active' : ''} onClick={() => setArtifactPath('events.jsonl')}>events.jsonl</button>
-              <button className={artifactPath === 'final/receipt.json' ? 'active' : ''} onClick={() => setArtifactPath('final/receipt.json')}>receipt.json</button>
-              <button className={artifactPath === 'gates/result.yaml' ? 'active' : ''} onClick={() => setArtifactPath('gates/result.yaml')}>gates.yaml</button>
-            </div>
-            <pre className="runs-artifact-content">{artifact ?? 'No artifact found.'}</pre>
-          </>
-        ) : <div className="skills-message">Select a run to inspect its artifacts.</div>}
+        <ArtifactsPanel run={selected} />
       </div>
     </div>
   </Page>
@@ -1262,7 +1619,6 @@ function SettingsView({ workspace, contextHandoff, onContextHandoffChange, limit
     <div className="settings-card">
       <div className="setting-row"><span><strong>Default workspace</strong><small>New sessions start in this directory</small></span><code>{workspace}</code></div>
       <div className="setting-row"><span><strong>Context handoff</strong><small>Generate a compact session summary (goal, plan, findings, changes) when switching providers or models, instead of forwarding the last 8 messages</small></span><label className="switch"><input type="checkbox" checked={contextHandoff} onChange={(event) => onContextHandoffChange(event.target.checked)} /><i /></label></div>
-      <div className="setting-row"><span><strong>Run confirmation</strong><small>Ask before an agent executes commands</small></span><label className="switch"><input type="checkbox" defaultChecked /><i /></label></div>
       <div className="setting-row"><span><strong>Quota limit action</strong><small>What happens when a credential profile hits its vendor usage limit during a run</small></span><div className="limit-action-select">
         <select value={limitAction} onChange={(event) => onLimitActionChange(event.target.value as 'fail' | 'ask' | 'rotate')}>
           <option value="fail">Fail the run</option>

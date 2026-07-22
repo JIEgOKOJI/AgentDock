@@ -31,9 +31,11 @@ test('council: writeDraft and readDraft round-trip', () => {
   const dir = tempDir()
   const result = council.writeDraft(dir, 's1', 'codex', 'Plan: step 1, step 2')
   assert.ok(result)
-  assert.ok(fs.existsSync(result))
-  const content = council.readDraft(dir, 's1', 'codex')
-  assert.equal(content, 'Plan: step 1, step 2')
+  assert.ok(fs.existsSync(result.path))
+  assert.ok(result.hash)
+  const draft = council.readDraft(dir, 's1', 'codex')
+  assert.equal(draft.content, 'Plan: step 1, step 2')
+  assert.ok(draft.hash)
 })
 
 test('council: readDraft returns null for missing', () => {

@@ -31,7 +31,7 @@ const emptyServer: ManagedMcpServer = {
   updatedAt: 0,
 }
 
-export function McpManagerView({ workspace }: { workspace: string }) {
+export function McpManagerView({ workspace, cliServers = [], onRefreshCli }: { workspace: string; cliServers?: McpServerInfo[]; onRefreshCli?: () => void }) {
   const [servers, setServers] = useState<ManagedMcpServer[]>([])
   const [conflicts, setConflicts] = useState<McpConflict[]>([])
   const [loading, setLoading] = useState(true)
@@ -66,6 +66,10 @@ export function McpManagerView({ workspace }: { workspace: string }) {
 
   useEffect(() => { void refresh() }, [workspace])
 
+  const builtinServers = cliServers.filter((server) => server.builtin)
+  const managedNames = new Set(servers.map((server) => server.name.trim().toLowerCase()))
+  const unmanagedServers = cliServers.filter((server) => !server.builtin && !managedNames.has(server.name.trim().toLowerCase()))
+
   const visibleServers = servers.filter((server) => {
     if (filterProvider !== 'all' && !server.providers.includes(filterProvider)) return false
     if (filterScope !== 'all' && server.scope !== filterScope) return false
@@ -94,6 +98,7 @@ export function McpManagerView({ workspace }: { workspace: string }) {
   }
 
   const remove = async (id: string, name: string) => {
+    if (!window.confirm(`Remove MCP server "${name}" from the catalog?\nRun "Apply changes" afterwards to update CLI configs.`)) return
     setError('')
     setNotice('')
     try {
@@ -157,10 +162,26 @@ export function McpManagerView({ workspace }: { workspace: string }) {
         const backups = result.results.filter((item) => item.backup).length
         setNotice(`Synced to ${result.results.length} CLI config${result.results.length === 1 ? '' : 's'}. ${backups} backup${backups === 1 ? '' : 's'} created.`)
       }
+      onRefreshCli?.()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setSyncing(false)
+    }
+  }
+
+  // Enable a server for every CLI and immediately write the configs, so one click
+  // makes the connection available in Codex, Claude Code, and OpenCode alike.
+  const syncToAllClis = async (server: ManagedMcpServer) => {
+    setError('')
+    setNotice('')
+    try {
+      const saved = await window.agentDock?.upsertManagedMcpServer({ ...server, providers: ['codex', 'claude', 'opencode'], workspace: server.scope === 'workspace' ? workspace : '' })
+      if (saved) setServers((items) => items.map((item) => (item.id === saved.id ? saved : item)))
+      await applyChanges()
+      setNotice(`${server.name} enabled for all CLIs and synced to their configs. Restart running CLI sessions to pick it up.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
     }
   }
 
@@ -212,9 +233,10 @@ export function McpManagerView({ workspace }: { workspace: string }) {
     <div className="page-heading">
       <div>
         <h1>MCP servers</h1>
-        <p>One catalog for every CLI agent — add, edit, sync, and verify MCP servers without editing config files by hand.</p>
+        <p>One place to manage MCP connections for every CLI — managed catalog, built-in AgentDock servers, and everything Codex, Claude Code, and OpenCode report.</p>
       </div>
       <div className="mcp-heading-actions">
+        <button className="mcp-tool-button" onClick={() => { void refresh(); onRefreshCli?.() }} title="Re-read the catalog and CLI-reported servers"><RefreshCw size={14} /> Refresh</button>
         <button className="primary-button" onClick={() => openEditor(null)}><Plus size={15} />Add server</button>
       </div>
     </div>
@@ -257,10 +279,36 @@ export function McpManagerView({ workspace }: { workspace: string }) {
       </div>
     </div>}
 
+    {builtinServers.length > 0 && <>
+      <div className="mcp-section-title">Built-in AgentDock servers<span>injected into runs automatically — no configuration needed</span></div>
+      <div className="mcp-server-list mcp-builtin-list">
+        {builtinServers.map((server) => {
+          const onDemand = !server.enabled && /delegate/i.test(server.name)
+          return <div className="mcp-server-row builtin" key={server.name}>
+            <div className="mcp-server-head">
+              <span className={`mcp-server-icon ${server.enabled ? 'on' : ''}`}><Zap size={18} /></span>
+              <div className="mcp-server-info">
+                <strong>{server.name}</strong>
+                <small>{server.detail}</small>
+              </div>
+              <div className="mcp-server-providers">
+                {(Object.keys(providerLabels) as ProviderId[]).map((id) => (
+                  <span key={id} className={server.providers.includes(id) ? 'available' : ''}>{providerLabels[id]}</span>
+                ))}
+              </div>
+              <span className={`status ${server.enabled ? 'ok' : onDemand ? 'idle' : ''}`}>{server.enabled ? 'Active' : onDemand ? 'On-demand' : 'Starting'}</span>
+            </div>
+          </div>
+        })}
+      </div>
+    </>}
+
+    <div className="mcp-section-title">Managed catalog<span>written to Codex, Claude Code, and OpenCode configs on “Apply changes”</span></div>
     {loading ? <div className="skills-message">Loading MCP servers…</div> : visibleServers.length ? (
       <div className="mcp-server-list">
         {visibleServers.map((server) => {
           const serverHealth = health[server.id]
+          const reported = cliServers.find((item) => !item.builtin && item.name.trim().toLowerCase() === server.name.trim().toLowerCase())
           return <div className={`mcp-server-row ${server.enabled ? '' : 'disabled'}`} key={server.id}>
             <div className="mcp-server-head">
               <span className={`mcp-server-icon ${server.enabled ? 'on' : ''}`}><PlugZap size={18} /></span>
@@ -269,9 +317,16 @@ export function McpManagerView({ workspace }: { workspace: string }) {
                 <small>{server.description || (server.transport === 'stdio' ? `${server.command} ${server.args.join(' ')}` : server.url)}</small>
               </div>
               <div className="mcp-server-providers">
-                {(Object.keys(providerLabels) as ProviderId[]).map((id) => (
-                  <span key={id} className={server.providers.includes(id) ? 'available' : ''} title={`${providerLabels[id]} ${server.providers.includes(id) ? 'active' : 'inactive'}`}>{providerLabels[id]}</span>
-                ))}
+                {(Object.keys(providerLabels) as ProviderId[]).map((id) => {
+                  const target = server.providers.includes(id)
+                  const connected = Boolean(reported?.providers.includes(id))
+                  const state = target && connected ? 'available' : target ? 'pending' : connected ? 'stray' : ''
+                  const title = target && connected ? `${providerLabels[id]}: connected — the CLI reports this server`
+                    : target ? `${providerLabels[id]}: in catalog but not reported by the CLI yet — Apply changes, then restart the CLI`
+                      : connected ? `${providerLabels[id]}: present in the CLI config but not targeted by the catalog entry`
+                        : `${providerLabels[id]}: off`
+                  return <span key={id} className={state} title={title}>{providerLabels[id]}{target && connected ? ' ●' : target ? ' ◌' : ''}</span>
+                })}
               </div>
               <span className="mcp-scope-badge">{server.scope === 'global' ? 'Global' : 'Workspace'}</span>
               <span className={`status ${server.enabled ? 'ok' : ''}`}>{server.enabled ? 'Enabled' : 'Disabled'}</span>
@@ -285,6 +340,9 @@ export function McpManagerView({ workspace }: { workspace: string }) {
                 <i />
               </label>
               <div className="mcp-server-actions">
+                {server.providers.length < 3 && <button className="mcp-server-action" onClick={() => void syncToAllClis(server)} disabled={syncing} title="Enable for Codex, Claude Code, and OpenCode and write their configs now">
+                  <Zap size={13} /> Sync to all CLIs
+                </button>}
                 <button className="mcp-server-action" onClick={() => void checkHealth(server)} disabled={checking === server.id} title="Check availability">
                   {checking === server.id ? <RefreshCw className="spin" size={13} /> : <CircleDot size={13} />} Check
                 </button>
@@ -296,6 +354,28 @@ export function McpManagerView({ workspace }: { workspace: string }) {
         })}
       </div>
     ) : <div className="skills-message">{servers.length ? 'No servers match this filter.' : 'No MCP servers configured yet. Add one or import from existing CLI configs.'}</div>}
+
+    {unmanagedServers.length > 0 && <>
+      <div className="mcp-section-title">Detected in CLI configs<span>reported by the CLIs but not in the managed catalog — use Import to take them over</span></div>
+      <div className="mcp-server-list">
+        {unmanagedServers.map((server) => <div className="mcp-server-row unmanaged" key={server.name}>
+          <div className="mcp-server-head">
+            <span className="mcp-server-icon"><PlugZap size={18} /></span>
+            <div className="mcp-server-info">
+              <strong>{server.name}</strong>
+              <small>{server.detail || 'Configured directly in a CLI config file'}</small>
+            </div>
+            <div className="mcp-server-providers">
+              {(Object.keys(providerLabels) as ProviderId[]).map((id) => (
+                <span key={id} className={server.providers.includes(id) ? 'available' : ''}>{providerLabels[id]}</span>
+              ))}
+            </div>
+            <span className={`status ${server.enabled ? 'ok' : ''}`}>{server.enabled ? 'Connected' : 'Not connected'}</span>
+            <button className="mcp-server-action" onClick={() => void importConfigs()} title="Import CLI-configured servers into the managed catalog"><Upload size={13} /> Import</button>
+          </div>
+        </div>)}
+      </div>
+    </>}
 
     {showEditor && <McpServerEditor
       server={editing}

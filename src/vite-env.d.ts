@@ -53,6 +53,7 @@ interface McpServerInfo {
   providers: ProviderId[]
   enabled: boolean
   detail: string
+  builtin?: boolean
 }
 
 type McpTransport = 'stdio' | 'sse' | 'http'
@@ -124,6 +125,7 @@ interface ChatMessage {
   content: string
   provider?: ProviderId
   pending?: boolean
+  at?: number
   activities?: AgentActivity[]
   files?: FileChangeSummary[]
 }
@@ -131,11 +133,12 @@ interface ChatMessage {
 interface FileChangeSummary { path: string; additions: number; deletions: number; diff?: string }
 interface AgentActivity {
   id: string
-  type: 'thinking' | 'command' | 'files' | 'tool'
+  type: 'thinking' | 'command' | 'files' | 'tool' | 'message'
   title: string
   detail?: string
   output?: string
   status?: string
+  position?: number
   files?: FileChangeSummary[]
 }
 
@@ -161,9 +164,17 @@ interface RunReceipt {
   intent: 'agent' | 'plan' | 'ask'
   prompt: string
   exitCode: number | null
-  outcome: 'success' | 'blocked' | 'needs_human' | 'cost_unverifiable' | 'exhausted_overshoot'
+  outcome: 'success' | 'blocked' | 'needs_human' | 'cost_unverifiable' | 'exhausted_overshoot' | 'cancelled' | 'interrupted'
   filesChanged: Array<{ path: string; additions: number; deletions: number }>
   usage: TokenUsage | null
+  cost?: { cost: number; type: string; unverifiable: boolean } | null
+  budget?: { maxUsd: number | null; spend: number; remaining: number | null; exceeded?: boolean; reason?: string } | null
+  warnings?: string[]
+  baseTreeHash?: string
+  cleanupWarning?: string
+  parentRunId?: string
+  kind?: string
+  planHash?: string
   startedAt: number
   finishedAt: number
 }
@@ -197,6 +208,9 @@ interface OpenQuestion {
   id: string
   kind: 'single' | 'multi' | 'text'
   text: string
+  required?: boolean
+  options?: string[]
+  value?: string
 }
 
 interface PlanResult {
@@ -206,18 +220,105 @@ interface PlanResult {
   planPath: string
 }
 
+interface PlanContract {
+  hash: string
+  answersHash: string
+  path: string
+  content: string
+  raw: string
+  openQuestions: OpenQuestion[]
+  readiness: 'ready' | 'needs_answers' | 'unverified'
+}
+
 interface RaceCandidate {
   candidateId: string
   provider: string
   profileId: string
   runId: string
+  baseTreeHash?: string | null
   exitCode: number | null
   patch: string
   summary: string
   filesChanged: Array<{ path: string; additions: number; deletions: number }>
   gateResult: { testPassed: boolean; overall: string; needsApproval: boolean } | null
   review: { verdict: 'approve' | 'reject' | 'needs_work'; quality: number; notes: string } | null
+  reviews?: Array<{ verdict: 'approve' | 'reject' | 'needs_work'; quality: number; notes: string; reviewer?: string }>
   score: number
+  failClosed?: boolean
+  spawnError?: string | null
+}
+
+interface CouncilDraft {
+  provider: string
+  ok: boolean
+  summary: string
+  path: string | null
+  hash?: string
+  runId?: string
+}
+
+interface ArtifactEntry {
+  path: string
+  size: number
+  contentType: string
+  hash: string | null
+}
+
+interface RunManifest {
+  version: number
+  runId: string
+  kind: string
+  generated: string
+  files: ArtifactEntry[]
+}
+
+type PipelineRole = 'formulate' | 'plan' | 'review' | 'implement' | 'verify' | 'custom'
+
+interface PipelineStep {
+  id: string
+  role: PipelineRole
+  provider: ProviderId
+  model: string
+  reasoning: string
+  instruction: string
+}
+
+interface PipelineConfig {
+  enabled: boolean
+  autopilot: boolean
+  maxFixRounds: number
+  steps: PipelineStep[]
+}
+
+interface PipelineStepOutput {
+  stepId: string
+  role: PipelineRole
+  provider: ProviderId
+  model: string
+  content: string
+  verdict?: 'pass' | 'fail'
+}
+
+interface PipelineRunState {
+  active: boolean
+  stepIndex: number
+  request: string
+  outputs: PipelineStepOutput[]
+  fixRounds: number
+  awaitingContinue: boolean
+  nextIndex: number | null
+  error: string
+}
+
+interface OrchestrationConfig {
+  isolated: boolean
+  intent: 'agent' | 'plan' | 'ask'
+  gates: { testCommand: string; protectedPaths: string }
+  repair: { attempts: number; untilClean: boolean }
+  maxUsd: string
+  delegate: { enabled: boolean; maxSubRuns: number; maxBestOfN: number }
+  race: { enabled: boolean; n: number; providers: string[]; reviewers: number; review: boolean; autoAdopt: boolean; minScore: number }
+  council: { enabled: boolean; providers: string[] }
 }
 
 interface CredentialProfile {
@@ -272,10 +373,13 @@ interface BrowserApi {
   onRequestBounds(listener: () => void): () => void
 }
 
+type PipelineTemplateOverrides = Partial<Record<Exclude<PipelineRole, 'custom'>, string>>
+
 interface AppSettings {
   defaultGlobalSkills: string[]
   contextHandoff: boolean
   limitAction: 'fail' | 'ask' | 'rotate'
+  pipelineTemplates: PipelineTemplateOverrides
 }
 
 interface Window {
@@ -315,6 +419,13 @@ interface Window {
     getLaneState(sessionId: string, provider: ProviderId, profileId?: string): Promise<LaneState>
     listRuns(sessionId?: string): Promise<RunReceipt[]>
     readRunArtifact(runId: string, artifactPath: string): Promise<string | null>
+    listRunArtifacts(runId: string): Promise<ArtifactEntry[]>
+    getRunManifest(runId: string): Promise<RunManifest | null>
+    verifyRunManifest(runId: string): Promise<{ ok: boolean; mismatches?: Array<Record<string, unknown>>; reason?: string }>
+    adoptRunPatch(request: { runId: string; sessionId: string; patch: string; baseTreeHash?: string | null }): Promise<{ ok: boolean; error?: string | null; adopted?: boolean; baseConflict?: boolean }>
+    rejectRunApproval(request: { runId: string }): Promise<{ ok: boolean; error?: string }>
+    getDelegateSubRunStatus(subRunId: string): Promise<{ state: string; kind: string; provider: string; startedAt: number; finishedAt: number | null } | null>
+    getDelegateSubRunResult(subRunId: string): Promise<Record<string, unknown> | null>
     prepareContinuity(request: {
       sessionId: string
       fromProvider: ProviderId
@@ -326,6 +437,7 @@ interface Window {
     saveCheckpoint(request: { sessionId: string; provider: ProviderId; profileId?: string; content: string }): Promise<boolean>
     createSession(request: Partial<ChatSession> & { workspace: string }): Promise<ChatSession>
     updateSession(request: ChatSession): Promise<ChatSession>
+    deleteSession(sessionId: string): Promise<boolean>
     chooseWorkspace(): Promise<string | null>
     chooseAttachments(): Promise<string[]>
     chooseWorkspaceAttachments(): Promise<string[]>
@@ -352,7 +464,8 @@ interface Window {
       repair?: { attempts: number; untilClean: boolean }
       maxUsd?: number
       isolated?: boolean
-    }): Promise<{ runId: string }>
+      delegate?: { maxSubRuns?: number; maxBestOfN?: number } | false
+    }): Promise<{ runId: string; blocked?: boolean; reason?: string }>
     stopAgent(runId: string): Promise<boolean>
     runRace(request: {
       provider: ProviderId
@@ -365,8 +478,9 @@ interface Window {
       attachments: string[]
       profileId?: string
       sessionId?: string
-      race?: { n: number; review: boolean; autoAdopt: boolean; providers?: string[] }
-    }): Promise<{ raceId: string; winner: RaceCandidate | null; scores: Array<{ candidateId: string; score: number; provider: string }>; candidates: RaceCandidate[] }>
+      gates?: { testCommand: string[] | null; protectedPaths: string[] }
+      race?: { n: number; review: boolean; autoAdopt: boolean; providers?: string[]; reviewers?: number; minScore?: number }
+    }): Promise<{ raceId: string; winner: RaceCandidate | null; scores: Array<{ candidateId: string; score: number; provider: string }>; candidates: RaceCandidate[]; reason?: string }>
     runCouncil(request: {
       provider: ProviderId
       permissionMode: PermissionMode
@@ -376,8 +490,8 @@ interface Window {
       profileId?: string
       sessionId: string
       council: { enabled: boolean; providers?: string[] }
-    }): Promise<{ councilId: string; drafts: Array<{ provider: string; ok: boolean; summary: string; path: string | null }>; mergedPlan: string | null; openQuestions: OpenQuestion[]; readiness: 'ready' | 'needs_answers' | 'unverified'; hash: string; planPath: string }>
-    readPlan(request: { sessionId: string }): Promise<{ hash: string; path: string; content: string; raw: string } | null>
+    }): Promise<{ councilId: string; drafts: CouncilDraft[]; mergedPlan: string | null; openQuestions: OpenQuestion[]; readiness: 'ready' | 'needs_answers' | 'unverified'; hash: string; planPath: string; reason?: string }>
+    readPlan(request: { sessionId: string }): Promise<PlanContract | null>
     verifyPlanHash(request: { sessionId: string; hash: string }): Promise<boolean>
     adoptPlan(request: { sessionId: string; planText: string; answers?: Array<{ text: string; value: string }> }): Promise<{ hash: string; path: string; readiness: 'ready' | 'needs_answers' | 'unverified' } | null>
     getBudgetSpend(request: { sessionId: string }): Promise<{ total: number; entries: Array<Record<string, unknown>> }>

@@ -39,7 +39,7 @@ export function parseAgentTranscript(provider, raw) {
     const key = `${item.type}|${item.title}|${item.detail || ''}|${item.output || ''}|${JSON.stringify(item.files || [])}`
     if (seenActivities.has(key)) return
     seenActivities.add(key)
-    activities.push({ id: `activity-${activities.length + 1}`, status: 'completed', ...item })
+    activities.push({ id: `activity-${activities.length + 1}`, status: 'completed', position, ...item })
     if (sourceId) sourceActivities.set(sourceId, activities.length - 1)
     if (item.type !== 'thinking') lastActionPosition = position
   }
@@ -131,6 +131,14 @@ export function parseAgentTranscript(provider, raw) {
 
   const finalAnswers = answers.filter((item) => item.position > lastActionPosition)
   const content = explicitSummary || (finalAnswers.length ? finalAnswers : answers.slice(-1)).map((item) => item.text).join('\n\n')
+  // Interleave intermediate assistant messages (progress notes between actions) into a
+  // chronological timeline so the UI can replay the run in the order it actually happened.
+  const usedForContent = new Set(finalAnswers.length ? finalAnswers : answers.slice(-1))
+  const interimNotes = answers.filter((item) => !usedForContent.has(item) && item.text !== content)
+  const timeline = [
+    ...activities,
+    ...interimNotes.map((item, index) => ({ id: `note-${index + 1}`, type: 'message', title: 'Update', detail: item.text, status: 'completed', position: item.position })),
+  ].sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
   const outcome = typedEvents.find((event) => event.type === 'agentdock.run.outcome')?.outcome || null
-  return { content, activities, finalFiles, cliSessionId, typedEvents, outcome }
+  return { content, activities, timeline, finalFiles, cliSessionId, typedEvents, outcome }
 }

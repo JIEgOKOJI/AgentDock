@@ -56,38 +56,90 @@ test('repair: detectStall returns false for less than threshold', () => {
 
 test('repair: shouldContinue returns false when gate passed', () => {
   const result = repair.shouldContinue({ attempt: 1, attempts: 3, untilClean: false, lastGatePassed: true, lastGateOutput: '', gateOutputs: [], cancelled: false })
-  assert.ok(!result)
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'success')
 })
 
 test('repair: shouldContinue returns false when cancelled', () => {
   const result = repair.shouldContinue({ attempt: 1, attempts: 3, untilClean: false, lastGatePassed: false, lastGateOutput: 'err', gateOutputs: [], cancelled: true })
-  assert.ok(!result)
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'cancelled')
 })
 
 test('repair: shouldContinue returns true when attempts remain', () => {
   const result = repair.shouldContinue({ attempt: 1, attempts: 3, untilClean: false, lastGatePassed: false, lastGateOutput: 'err', gateOutputs: [], cancelled: false })
-  assert.ok(result)
+  assert.ok(result.continue)
+  assert.equal(result.reason, 'retry')
 })
 
 test('repair: shouldContinue returns false when attempts exhausted', () => {
   const result = repair.shouldContinue({ attempt: 3, attempts: 3, untilClean: false, lastGatePassed: false, lastGateOutput: 'err', gateOutputs: [], cancelled: false })
-  assert.ok(!result)
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'max_attempts')
 })
 
 test('repair: shouldContinue with untilClean stops on stall', () => {
   const gateOutputs = ['same', 'same']
   const result = repair.shouldContinue({ attempt: 4, attempts: 1, untilClean: true, lastGatePassed: false, lastGateOutput: 'same', gateOutputs, cancelled: false })
-  assert.ok(!result)
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'stall')
 })
 
 test('repair: shouldContinue with untilClean continues when no stall', () => {
   const result = repair.shouldContinue({ attempt: 2, attempts: 1, untilClean: true, lastGatePassed: false, lastGateOutput: 'different', gateOutputs: ['err1'], cancelled: false })
-  assert.ok(result)
+  assert.ok(result.continue)
+  assert.equal(result.reason, 'retry')
 })
 
 test('repair: shouldContinue with untilClean stops at MAX_ATTEMPTS', () => {
   const result = repair.shouldContinue({ attempt: repair.MAX_ATTEMPTS, attempts: 1, untilClean: true, lastGatePassed: false, lastGateOutput: 'different', gateOutputs: [], cancelled: false })
-  assert.ok(!result)
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'max_attempts')
+})
+
+test('repair: shouldContinue stops on protectedTriggered', () => {
+  const result = repair.shouldContinue({ attempt: 1, attempts: 3, untilClean: false, lastGatePassed: false, lastGateOutput: 'err', gateOutputs: [], cancelled: false, protectedTriggered: true })
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'protected_approval_needed')
+})
+
+test('repair: shouldContinue stops on budgetExhausted', () => {
+  const result = repair.shouldContinue({ attempt: 1, attempts: 3, untilClean: false, lastGatePassed: false, lastGateOutput: 'err', gateOutputs: [], cancelled: false, budgetExhausted: true })
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'budget_exhausted')
+})
+
+test('repair: shouldContinue stops on spawnError', () => {
+  const result = repair.shouldContinue({ attempt: 1, attempts: 3, untilClean: false, lastGatePassed: false, lastGateOutput: 'err', gateOutputs: [], cancelled: false, spawnError: true })
+  assert.ok(!result.continue)
+  assert.equal(result.reason, 'spawn_error')
+})
+
+test('repair: stallFingerprint combines gate output and patch hash', () => {
+  const fp1 = repair.stallFingerprint('error msg', 'abc123')
+  const fp2 = repair.stallFingerprint('error msg', 'abc123')
+  const fp3 = repair.stallFingerprint('error msg', 'def456')
+  assert.equal(fp1, fp2)
+  assert.notEqual(fp1, fp3)
+})
+
+test('repair: detectStallByFingerprint detects repeated identical fingerprints', () => {
+  const fps = ['same::hash1', 'same::hash1', 'same::hash1']
+  assert.ok(repair.detectStallByFingerprint(fps))
+})
+
+test('repair: detectStallByFingerprint returns false for different patch hashes', () => {
+  const fps = ['err::hash1', 'err::hash2', 'err::hash3']
+  assert.ok(!repair.detectStallByFingerprint(fps))
+})
+
+test('repair: writeAttemptArtifact creates per-attempt file', () => {
+  const dir = tempDir()
+  repair.writeAttemptArtifact(dir, 'run-1', 2, 'patch.diff', '--- a\n+++ b\n')
+  const filePath = path.join(dir, 'runs', 'run-1', 'repair', '2', 'patch.diff')
+  assert.ok(fs.existsSync(filePath))
+  const content = fs.readFileSync(filePath, 'utf8')
+  assert.ok(content.includes('+++ b'))
 })
 
 test('repair: writeAttemptLog creates log file', () => {

@@ -1,7 +1,9 @@
 const path = require('node:path')
 const fs = require('node:fs')
 
-const CONTINUITY_VERSION = 1
+const CONTINUITY_VERSION = 2
+const DEFAULT_BYTE_BUDGET = 32768
+const DEFAULT_MAX_MESSAGES = 20
 
 function continuityDir(userData, sessionId) {
   const safe = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64)
@@ -61,7 +63,8 @@ function readThread(userData, sessionId) {
   }
 }
 
-function buildContinuationPacket({ fromLane, toLane, checkpoint, threadPath, deltaSummary, sessionId }) {
+function buildContinuationPacket({ fromLane, toLane, checkpoint, threadPath, deltaSummary, sessionId, byteBudget, messages, lastDeliveredId }) {
+  const budget = Number.isFinite(byteBudget) ? byteBudget : DEFAULT_BYTE_BUDGET
   const lines = []
   lines.push(`# Continuation packet`)
   lines.push(``)
@@ -75,10 +78,32 @@ function buildContinuationPacket({ fromLane, toLane, checkpoint, threadPath, del
     lines.push(checkpoint)
     lines.push(``)
   }
+  // 6.5: Build delta from messages since lastDeliveredId, with byte budget
+  if (Array.isArray(messages) && messages.length) {
+    const deltaMessages = lastDeliveredId ? messages.filter((m) => m.id && m.id !== lastDeliveredId && m.laneId !== toLane) : messages
+    const limitedMessages = deltaMessages.slice(-DEFAULT_MAX_MESSAGES)
+    let usedBytes = 0
+    const includedMessages = []
+    for (const message of limitedMessages) {
+      if (message.id === 'hello') continue
+      const content = String(message.content || '').slice(0, 4000)
+      const entry = `### ${message.role === 'user' ? 'User' : (message.provider || 'assistant')}\n${content}\n`
+      if (usedBytes + entry.length > budget && includedMessages.length > 0) break
+      includedMessages.push(entry)
+      usedBytes += entry.length
+    }
+    if (includedMessages.length) {
+      lines.push(`## Delta since last checkpoint (${includedMessages.length} messages, ${usedBytes} bytes)`)
+      lines.push(``)
+      lines.push(includedMessages.join('\n'))
+      lines.push(``)
+    }
+  }
   if (deltaSummary) {
-    lines.push(`## Delta since last checkpoint`)
+    lines.push(`## Delta summary`)
     lines.push(``)
-    lines.push(deltaSummary)
+    const truncatedSummary = String(deltaSummary).slice(0, budget)
+    lines.push(truncatedSummary)
     lines.push(``)
   }
   lines.push(`## Instruction`)
@@ -104,6 +129,29 @@ function continuityEventPayload(fromLane, toLane, threadFilePath, reason) {
 
 function laneLabel(provider, profileId) {
   return `${provider}:${profileId || 'default'}`
+}
+
+// 6.5: Track last delivered message/event id per target lane
+function deliveredIdPath(userData, sessionId, provider, profileId) {
+  const profile = profileId || 'default'
+  const providerSafe = String(provider).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32)
+  const profileSafe = String(profile).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32)
+  return path.join(continuityDir(userData, sessionId), `${providerSafe}-${profileSafe}-delivered.json`)
+}
+
+function readDeliveredId(userData, sessionId, provider, profileId) {
+  try {
+    return JSON.parse(fs.readFileSync(deliveredIdPath(userData, sessionId, provider, profileId), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function writeDeliveredId(userData, sessionId, provider, profileId, data) {
+  try {
+    ensureContinuityDir(userData, sessionId)
+    fs.writeFileSync(deliveredIdPath(userData, sessionId, provider, profileId), JSON.stringify(data), 'utf8')
+  } catch {}
 }
 
 function buildThreadFromMessages(messages, sessionId) {
@@ -134,6 +182,8 @@ function buildThreadFromMessages(messages, sessionId) {
 
 module.exports = {
   CONTINUITY_VERSION,
+  DEFAULT_BYTE_BUDGET,
+  DEFAULT_MAX_MESSAGES,
   continuityDir,
   checkpointPath,
   threadPath,
@@ -146,4 +196,7 @@ module.exports = {
   continuityEventPayload,
   laneLabel,
   buildThreadFromMessages,
+  deliveredIdPath,
+  readDeliveredId,
+  writeDeliveredId,
 }

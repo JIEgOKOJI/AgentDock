@@ -39,14 +39,32 @@ function detectStall(gateOutputs) {
   return normalized.every((item) => item === first)
 }
 
-function shouldContinue({ attempt, attempts, untilClean, lastGatePassed, lastGateOutput, gateOutputs, cancelled }) {
-  if (cancelled) return false
-  if (lastGatePassed) return false
+function stallFingerprint(gateOutput, patchHash) {
+  const normalizedGate = String(gateOutput || '').trim().replace(/\s+/g, ' ').slice(0, 500)
+  return `${normalizedGate}::${String(patchHash || '').slice(0, 16)}`
+}
+
+function detectStallByFingerprint(fingerprints) {
+  if (!Array.isArray(fingerprints) || fingerprints.length < STALL_THRESHOLD) return false
+  const recent = fingerprints.slice(-STALL_THRESHOLD)
+  const first = recent[0]
+  return recent.every((item) => item === first)
+}
+
+function shouldContinue({ attempt, attempts, untilClean, lastGatePassed, lastGateOutput, gateOutputs, cancelled, stallFingerprints, budgetExhausted, protectedTriggered, spawnError }) {
+  if (cancelled) return { continue: false, reason: 'cancelled' }
+  if (lastGatePassed) return { continue: false, reason: 'success' }
+  if (spawnError) return { continue: false, reason: 'spawn_error' }
+  if (protectedTriggered) return { continue: false, reason: 'protected_approval_needed' }
+  if (budgetExhausted) return { continue: false, reason: 'budget_exhausted' }
   if (untilClean) {
-    if (detectStall([...gateOutputs, lastGateOutput])) return false
-    return attempt < MAX_ATTEMPTS
+    if (stallFingerprints && detectStallByFingerprint(stallFingerprints)) return { continue: false, reason: 'stall' }
+    if (detectStall([...gateOutputs, lastGateOutput])) return { continue: false, reason: 'stall' }
+    if (attempt >= MAX_ATTEMPTS) return { continue: false, reason: 'max_attempts' }
+    return { continue: true, reason: 'retry' }
   }
-  return attempt < attempts
+  if (attempt >= attempts) return { continue: false, reason: 'max_attempts' }
+  return { continue: true, reason: 'retry' }
 }
 
 function repairDir(userData, runId) {
@@ -64,6 +82,20 @@ function writeAttemptLog(userData, runId, attempts) {
     ensureRepairDir(userData, runId)
     const lines = attempts.map((a, i) => `--- Attempt ${i + 1} ---\nexit: ${a.exitCode}\ngate: ${a.gateOverall || 'n/a'}\npassed: ${a.gatePassed}\n${a.gateOutput?.slice(0, 2000) || ''}`)
     fs.writeFileSync(path.join(repairDir(userData, runId), 'attempts.log'), lines.join('\n\n'), 'utf8')
+  } catch {}
+}
+
+function ensureAttemptDir(userData, runId, attemptNumber) {
+  const dir = path.join(repairDir(userData, runId), String(attemptNumber))
+  fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+function writeAttemptArtifact(userData, runId, attemptNumber, filename, content) {
+  if (!content) return
+  try {
+    const dir = ensureAttemptDir(userData, runId, attemptNumber)
+    fs.writeFileSync(path.join(dir, filename), content, 'utf8')
   } catch {}
 }
 
@@ -85,9 +117,13 @@ module.exports = {
   normalizeRepairConfig,
   buildRepairPrompt,
   detectStall,
+  stallFingerprint,
+  detectStallByFingerprint,
   shouldContinue,
   repairDir,
   ensureRepairDir,
   writeAttemptLog,
+  ensureAttemptDir,
+  writeAttemptArtifact,
   repairEventPayload,
 }

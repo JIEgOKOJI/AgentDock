@@ -4,32 +4,49 @@ const path = require('node:path')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
 const { globalSkillPrompt, hashSkillDirectory, isInside, listSkills, shareTargetPaths, skillRoot, skillTemplate } = require('./skills.cjs')
-const { normalizePermissionMode, permissionLaunchOptions } = require('./permissions.cjs')
+const { normalizePermissionMode, permissionLaunchOptions, readOnlyPermissionOptions, isReadOnlyIntent, effectivePermissionOptions } = require('./permissions.cjs')
 const { adapters } = require('./adapters.cjs')
 const { createBrowserManager } = require('./browser-manager.cjs')
 const { createBrowserAutomation } = require('./browser-automation.cjs')
 const { createBrowserMcp, SERVER_NAME: BROWSER_MCP_NAME } = require('./browser-mcp.cjs')
 const { browserMcpLaunchOptions, withBrowserAwarenessPrompt } = require('./browser-mcp-config.cjs')
+const { createDelegateMcp, SERVER_NAME: DELEGATE_MCP_NAME } = require('./delegate-mcp.cjs')
+const { normalizeDelegateConfig, buildPolicy, combinedMcpLaunchOptions, withDelegateAwarenessPrompt } = require('./delegate-mcp-config.cjs')
+const { injectMcpServers } = require('./mcp-injection.cjs')
 const { normalizeBounds } = require('./browser-url.cjs')
 const mcp = require('./mcp-manager.cjs')
+const { ORCHESTRATOR_VERSION, generateRunId, prepareEnvelope, executeAttempt, captureChanges, verifyGates, verifyBaseCompatible, adoptPatch, computeOutcome, cleanupEnvelope, runWithRepairLoop, workspaceChangeDelta: orchestratorDelta } = require('./run-orchestrator.cjs')
 
 const running = new Map()
 const SESSION_STORE_VERSION = 1
 const SETTINGS_STORE_VERSION = 3
 const getCodexHome = () => process.env.CODEX_HOME || path.join(app.getPath('home'), '.codex')
-const { readProfiles, writeProfiles, normalizeProfile, profileEnvOverlay, findProfile, readyProfilesForProvider, isProfileExhausted, nextReadyProfile, detectDefaultProfiles, mergeProfiles } = require('./profiles.cjs')
+const { readProfiles, writeProfiles, normalizeProfile, profileEnvOverlay, findProfile, readyProfilesForProvider, isProfileExhausted, isTypedVendorLimitSignal, isProfileReady, nextReadyProfile, nextReadyProfileByLimits, detectDefaultProfiles, mergeProfiles } = require('./profiles.cjs')
 const { ensureLaneDir, normalizeLanes, getLaneState, setLaneState, migrateLegacySession } = require('./lanes.cjs')
-const { ensureRunDir, appendEvents, writePatch, writeSummary, writeReceipt, listRuns, readArtifact, buildDiffFromChanges, normalizeReceipt } = require('./artifacts.cjs')
-const { writeCheckpoint, readCheckpoint, writeThread, readThread, buildContinuationPacket, continuityEventPayload, laneLabel, buildThreadFromMessages } = require('./continuity.cjs')
-const { planPrefix, parseOpenQuestions, classifyPlanReadiness, writePlanContract, readPlanContract, verifyPlanHash, contentHash } = require('./plan.cjs')
+const { ensureRunDir, appendEvents, writePatch, writeSummary, writePlanArtifact, writeTelemetry, writeReceipt, readReceipt, listRuns, readArtifact, readArtifactByManifest, listArtifacts, writeManifest, readManifest, verifyManifestHashes, recoverEventsJsonl, startupRecovery, buildDiffFromChanges, normalizeReceipt, workspaceFingerprint } = require('./artifacts.cjs')
+const { writeCheckpoint, readCheckpoint, writeThread, readThread, buildContinuationPacket, continuityEventPayload, laneLabel, buildThreadFromMessages, readDeliveredId, writeDeliveredId } = require('./continuity.cjs')
+const { planPrefix, parseOpenQuestions, classifyPlanReadiness, writePlanContract, readPlanContract, verifyPlanHash, contentHash, verifyPlanContentHash, normalizeOpenQuestions } = require('./plan.cjs')
 const { normalizeGatesConfig, checkProtectedPaths, runGateCommand, writeGateResult, evaluateGates } = require('./gates.cjs')
-const { normalizeRepairConfig, buildRepairPrompt, detectStall, shouldContinue, writeAttemptLog, repairEventPayload, MAX_ATTEMPTS } = require('./repair.cjs')
-const { estimateRunCost, normalizeBudget, checkBudget, appendSpendEntry, sessionSpend, readSpendLedger, totalSpend } = require('./budget.cjs')
-const { createWorktree, captureWorktreeDiff, applyPatch, removeWorktree, isGitRepo } = require('./worktree.cjs')
-const { normalizeRaceConfig, writeCandidateArtifact, normalizeCandidate, scoreCandidate, arbitrate, buildReviewPrompt, parseReviewResponse, writeArbitrationResult, raceEventPayload, selectProvidersForRace, ensureRaceDir } = require('./race.cjs')
-const { normalizeCouncilConfig, writeDraft, readDraft, listDrafts, buildMergePrompt, councilEventPayload, ensureCouncilDir } = require('./council.cjs')
+const { normalizeRepairConfig, buildRepairPrompt, detectStall, shouldContinue, writeAttemptLog, repairEventPayload, MAX_ATTEMPTS, stallFingerprint, writeAttemptArtifact } = require('./repair.cjs')
+const { estimateRunCost, normalizeBudget, checkBudget, hasBudgetHeadroom, appendSpendEntry, sessionSpend, readSpendLedger, totalSpend, reserveBudget, releaseReservation, settleReservation, totalReserved, clearReservations, pricingSnapshot } = require('./budget.cjs')
+const { createWorktree, captureWorktreeDiff, applyPatch, removeWorktree, isGitRepo, getBaseTreeHash, createNonGitEnvelope } = require('./worktree.cjs')
+const { normalizeRaceConfig, writeCandidateArtifact, normalizeCandidate, scoreCandidate, arbitrate, buildReviewPrompt, parseReviewResponse, writeArbitrationResult, writeReviewArtifact, raceEventPayload, selectProvidersForRace, selectReviewersForCandidate, ensureRaceDir, providerFamily, distinctReviewFamilies } = require('./race.cjs')
+const { normalizeCouncilConfig, writeDraft, readDraft, listDrafts, buildMergePrompt, councilEventPayload, ensureCouncilDir, contentHash: councilContentHash, mergeOpenQuestions, selectCouncilProviders } = require('./council.cjs')
 
-const DEFAULT_SETTINGS = { defaultGlobalSkills: [], contextHandoff: true, limitAction: 'fail' }
+const DEFAULT_SETTINGS = { defaultGlobalSkills: [], contextHandoff: true, limitAction: 'fail', pipelineTemplates: {} }
+
+// Pipeline role templates the user may override; custom has no default template.
+const PIPELINE_TEMPLATE_ROLES = ['formulate', 'plan', 'review', 'implement', 'verify']
+
+function sanitizePipelineTemplates(value) {
+  const result = {}
+  if (value && typeof value === 'object') {
+    for (const role of PIPELINE_TEMPLATE_ROLES) {
+      if (typeof value[role] === 'string' && value[role].trim()) result[role] = value[role]
+    }
+  }
+  return result
+}
 
 const browserManager = createBrowserManager()
 const browserAutomation = createBrowserAutomation(browserManager)
@@ -68,6 +85,7 @@ function readSettings() {
       defaultGlobalSkills: Array.isArray(store.defaultGlobalSkills) ? [...new Set(store.defaultGlobalSkills.filter((id) => typeof id === 'string' && id.startsWith('global:')))] : [],
       contextHandoff: typeof store.contextHandoff === 'boolean' ? store.contextHandoff : true,
       limitAction: store.limitAction === 'rotate' || store.limitAction === 'ask' ? store.limitAction : 'fail',
+      pipelineTemplates: sanitizePipelineTemplates(store.pipelineTemplates),
     }
   } catch {
     return { ...DEFAULT_SETTINGS }
@@ -423,12 +441,13 @@ async function loadSystemInfo() {
 
 async function loadMcpServers() {
   const servers = new Map()
-  const add = (name, provider, enabled = true, detail = '') => {
+  const add = (name, provider, enabled = true, detail = '', builtin = false) => {
     if (!name) return
-    const current = servers.get(name) || { name, providers: [], enabled: false, detail: '' }
+    const current = servers.get(name) || { name, providers: [], enabled: false, detail: '', builtin }
     if (!current.providers.includes(provider)) current.providers.push(provider)
     current.enabled ||= enabled
     current.detail ||= detail
+    current.builtin ||= builtin
     servers.set(name, current)
   }
 
@@ -451,9 +470,19 @@ async function loadMcpServers() {
     if (match) add(match[1].trim(), 'opencode', /connected|enabled/i.test(line), 'OpenCode')
   }
   // Managed embedded browser MCP — automatically injected into every agent run.
-  add(BROWSER_MCP_NAME, 'codex', browserMcpReady, browserMcpReady ? 'AgentDock embedded browser (auto-injected)' : 'AgentDock embedded browser (starting)')
-  add(BROWSER_MCP_NAME, 'claude', browserMcpReady, browserMcpReady ? 'AgentDock embedded browser (auto-injected)' : 'AgentDock embedded browser (starting)')
-  add(BROWSER_MCP_NAME, 'opencode', browserMcpReady, browserMcpReady ? 'AgentDock embedded browser (auto-injected)' : 'AgentDock embedded browser (starting)')
+  const browserDetail = browserMcpReady ? 'Embedded browser MCP — injected into every agent run' : 'Embedded browser MCP — starting up'
+  add(BROWSER_MCP_NAME, 'codex', browserMcpReady, browserDetail, true)
+  add(BROWSER_MCP_NAME, 'claude', browserMcpReady, browserDetail, true)
+  add(BROWSER_MCP_NAME, 'opencode', browserMcpReady, browserDetail, true)
+  // Delegation Belt (#12) — injected on demand when a run opts into delegation.
+  // Not being active at idle is normal, so the UI shows it as "on-demand", not unavailable.
+  const delegateReady = delegateServers.size > 0
+  const delegateDetail = delegateReady
+    ? 'Delegation belt MCP — active in the current run'
+    : 'Delegation belt MCP — injected when “Allow delegation” is enabled in the Orchestration panel'
+  add(DELEGATE_MCP_NAME, 'codex', delegateReady, delegateDetail, true)
+  add(DELEGATE_MCP_NAME, 'claude', delegateReady, delegateDetail, true)
+  add(DELEGATE_MCP_NAME, 'opencode', delegateReady, delegateDetail, true)
   return [...servers.values()]
 }
 
@@ -630,6 +659,7 @@ ipcMain.handle('settings:patch', (_event, request = {}) => {
   const settings = readSettings()
   if (typeof request.contextHandoff === 'boolean') settings.contextHandoff = request.contextHandoff
   if (request.limitAction === 'fail' || request.limitAction === 'ask' || request.limitAction === 'rotate') settings.limitAction = request.limitAction
+  if (request.pipelineTemplates && typeof request.pipelineTemplates === 'object') settings.pipelineTemplates = sanitizePipelineTemplates(request.pipelineTemplates)
   writeSettings(settings)
   return settings
 })
@@ -797,6 +827,40 @@ ipcMain.handle('runs:read-artifact', (_event, request = {}) => {
   return readArtifact(app.getPath('userData'), request.runId, request.path)
 })
 
+ipcMain.handle('runs:list-artifacts', (_event, request = {}) => {
+  if (!request?.runId) return []
+  return listArtifacts(app.getPath('userData'), request.runId)
+})
+
+ipcMain.handle('runs:manifest', (_event, request = {}) => {
+  if (!request?.runId) return null
+  return readManifest(app.getPath('userData'), request.runId)
+})
+
+ipcMain.handle('runs:verify-manifest', (_event, request = {}) => {
+  if (!request?.runId) return { ok: false, reason: 'no_runId' }
+  return verifyManifestHashes(app.getPath('userData'), request.runId)
+})
+
+// Delegation Belt (#12): read-only status/result IPC for the UI. Sub-runs are
+// spawned by the agent via the agentdock-delegate MCP server; the UI polls these
+// to surface delegation activity in the Artifacts tab.
+ipcMain.handle('delegate:status', (_event, request = {}) => {
+  const subRunId = request?.subRunId
+  if (!subRunId) return null
+  const record = delegateRuns.get(subRunId)
+  if (!record) return null
+  return { state: record.status, kind: record.kind, provider: record.provider, startedAt: record.startedAt, finishedAt: record.finishedAt }
+})
+
+ipcMain.handle('delegate:result', (_event, request = {}) => {
+  const subRunId = request?.subRunId
+  if (!subRunId) return null
+  const record = delegateRuns.get(subRunId)
+  if (!record || record.status === 'running') return null
+  return record.result || null
+})
+
 ipcMain.handle('continuity:prepare', (_event, request = {}) => {
   const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
   if (!sessionId) return null
@@ -811,15 +875,21 @@ ipcMain.handle('continuity:prepare', (_event, request = {}) => {
   const userData = app.getPath('userData')
   const checkpoint = readCheckpoint(userData, sessionId, fromProvider, fromProfileId)
   const messages = Array.isArray(request?.messages) ? request.messages : []
+  // 6.5: Track last delivered message id per target lane
+  const delivered = readDeliveredId(userData, sessionId, toProvider, toProfileId)
+  const lastDeliveredId = delivered?.lastMessageId || null
   const threadContent = buildThreadFromMessages(messages, sessionId)
   const threadFilePath = writeThread(userData, sessionId, threadContent)
   if (!threadFilePath) return null
   const packet = buildContinuationPacket({
     fromLane, toLane, checkpoint, threadPath: threadFilePath,
-    deltaSummary: '', sessionId,
+    deltaSummary: '', sessionId, messages, lastDeliveredId,
   })
   const packetPath = path.join(path.dirname(threadFilePath), `continuation-${Date.now()}.md`)
   try { fs.writeFileSync(packetPath, packet, 'utf8') } catch { return null }
+  // 6.5: Update delivered id after packet is written
+  const lastMessage = messages.length ? messages[messages.length - 1] : null
+  if (lastMessage?.id) writeDeliveredId(userData, sessionId, toProvider, toProfileId, { lastMessageId: lastMessage.id, ts: Date.now() })
   return { packetPath, threadFilePath, event: continuityEventPayload(fromLane, toLane, threadFilePath, 'lane_switch') }
 })
 
@@ -837,7 +907,20 @@ ipcMain.handle('continuity:checkpoint', (_event, request = {}) => {
 ipcMain.handle('plan:read', (_event, request = {}) => {
   const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
   if (!sessionId) return null
-  return readPlanContract(app.getPath('userData'), sessionId)
+  const contract = readPlanContract(app.getPath('userData'), sessionId)
+  if (!contract) return null
+  const openQuestions = parseOpenQuestions(contract.content)
+  const answersMatch = contract.raw.match(/## Provided Answers\n\n([\s\S]*?)(?:\n\n|$)/)
+  if (answersMatch) {
+    for (const line of answersMatch[1].split(/\r?\n/)) {
+      const lineMatch = line.match(/^-\s+\*\*(.+?)\*\*:\s*(.*)$/)
+      if (!lineMatch) continue
+      const question = openQuestions.find((q) => q.text === lineMatch[1])
+      if (question) question.value = lineMatch[2]
+    }
+  }
+  const readiness = classifyPlanReadiness(contract.content, openQuestions)
+  return { ...contract, openQuestions, readiness }
 })
 
 ipcMain.handle('plan:verify-hash', (_event, request = {}) => {
@@ -856,6 +939,46 @@ ipcMain.handle('plan:adopt', (_event, request = {}) => {
   const result = writePlanContract(app.getPath('userData'), sessionId, planText, answers)
   if (!result) return null
   return { hash: result.hash, path: result.path, readiness: classifyPlanReadiness(planText, parseOpenQuestions(planText)) }
+})
+
+// 7.3: Approval inbox / manual candidate adoption — reuses the same safe
+// adopt pipeline as isolated runs (base-hash check, git apply --check).
+ipcMain.handle('runs:adopt-patch', async (_event, request = {}) => {
+  const runId = typeof request?.runId === 'string' ? request.runId : ''
+  const patch = typeof request?.patch === 'string' ? request.patch : ''
+  const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
+  const baseTreeHash = typeof request?.baseTreeHash === 'string' ? request.baseTreeHash : null
+  if (!runId || !patch || !sessionId) return { ok: false, error: 'missing_fields' }
+  const session = readSessions().find((item) => item.id === sessionId)
+  if (!session) return { ok: false, error: 'session_not_found' }
+  const workspace = path.resolve(session.workspace)
+  const userData = app.getPath('userData')
+  const result = await adoptPatch({ workspace, patch, baseTreeHash, emit: null, appendArtifact: null, runId })
+  if (result.ok) {
+    const receipt = readReceipt(userData, runId)
+    if (receipt) {
+      writeReceipt(userData, runId, normalizeReceipt({
+        ...receipt,
+        outcome: 'success',
+        warnings: (receipt.warnings || []).filter((w) => !/needs.human|needs.approval/i.test(w)),
+      }))
+    }
+  }
+  return result
+})
+
+ipcMain.handle('runs:reject-approval', (_event, request = {}) => {
+  const runId = typeof request?.runId === 'string' ? request.runId : ''
+  if (!runId) return { ok: false, error: 'missing_runId' }
+  const userData = app.getPath('userData')
+  const receipt = readReceipt(userData, runId)
+  if (!receipt) return { ok: false, error: 'receipt_not_found' }
+  writeReceipt(userData, runId, normalizeReceipt({
+    ...receipt,
+    outcome: 'blocked',
+    warnings: [...(receipt.warnings || []), 'Rejected by user — patch not adopted'],
+  }))
+  return { ok: true }
 })
 
 ipcMain.handle('budget:spend', (_event, request = {}) => {
@@ -898,6 +1021,15 @@ ipcMain.handle('sessions:update', (_event, request) => {
   sessions.sort((a, b) => b.updatedAt - a.updatedAt)
   writeSessions(sessions)
   return updated
+})
+
+ipcMain.handle('sessions:delete', (_event, sessionId) => {
+  if (typeof sessionId !== 'string' || !sessionId) return false
+  const sessions = readSessions()
+  const remaining = sessions.filter((session) => session.id !== sessionId)
+  if (remaining.length === sessions.length) return false
+  writeSessions(remaining)
+  return true
 })
 
 ipcMain.handle('workspace:choose', async () => {
@@ -1020,6 +1152,146 @@ function extractTokenUsage(provider, raw) {
   return null
 }
 
+// Delegation Belt (#12): per-run registry of sub-runs spawned by the agent via
+// the agentdock-delegate MCP server. Sub-runs are scoped to their parent run:
+// they cannot apply patches, approve gates, rotate profiles, or change settings.
+// Each sub-run reuses the artifacts infra (own runId) and attributes spend to the
+// parent session. Nesting depth is capped to 1 — sub-runs cannot delegate.
+const delegateRuns = new Map()
+const delegateServers = new Map()
+
+function delegateRunRecord(runId, kind, parentId, sessionId, provider, profileId, status, result) {
+  return {
+    runId,
+    kind,
+    parentId,
+    sessionId,
+    provider,
+    profileId,
+    status,
+    result,
+    startedAt: Date.now(),
+    finishedAt: null,
+  }
+}
+
+// Sub-run runner for the Delegation Belt (#12). Spawned by the agent via the
+// agentdock-delegate MCP server. Reuses the same adapters/artifacts infra as a
+// top-level run but is scoped: ask/plan are read-only, agent runs inside an
+// isolated worktree, race reuses the race pipeline without autoAdopt. Sub-runs
+// do NOT inject the delegate MCP (nesting depth capped to 1) — they keep the
+// browser MCP only. Spend is attributed to the parent session for budget
+// enforcement.
+//
+// 6.4: spawnSubRun returns subRunId immediately; execution continues async.
+// Status/result recoverable from artifacts after restart.
+async function runDelegateSubRun({ kind, params, parentRunId, sessionId, parentProvider, parentProfileId, workspace, userData, home, availableSkills, emit, policy }) {
+  const provider = params.provider || parentProvider
+  const adapter = adapters[provider]
+  if (!adapter) return { subRunId: null, ok: false, error: `Unknown provider: ${provider}` }
+  // 6.4: Restrict provider/profile to parent policy
+  if (policy?.allowedProviders?.length && !policy.allowedProviders.includes(provider)) {
+    return { subRunId: null, ok: false, error: `Provider ${provider} not allowed by parent policy` }
+  }
+  const profiles = mergeProfiles(readProfiles(userData, home), detectDefaultProfiles(home))
+  const profile = findProfile(profiles, params.profileId || parentProfileId) || null
+  // 6.4: Enforced read-only for ask/plan
+  const intent = kind === 'ask' ? 'ask' : kind === 'plan' ? 'plan' : 'agent'
+  const permissionMode = isReadOnlyIntent(intent) ? 'ask' : (params.permissionMode || 'auto')
+  const permissions = permissionLaunchOptions(provider, permissionMode, { ...process.env, ...(profile ? profileEnvOverlay(profile) : {}) })
+  const browserDescriptor = browserMcpReady ? browserMcp.descriptor() : null
+  const subRunId = crypto.randomUUID()
+  // 6.4: Register immediately as 'queued' and return subRunId
+  delegateRuns.set(subRunId, delegateRunRecord(subRunId, kind, parentRunId, sessionId, provider, profile ? profile.id : '', 'queued', null))
+  ensureRunDir(userData, subRunId)
+  if (emit) emit('delegate.subrun_started', { parentRunId, subRunId, kind, provider, intent })
+  // 6.4: Execute asynchronously — do not await
+  executeDelegateSubRun({ kind, params, parentRunId, sessionId, provider, profile, subRunId, permissions, browserDescriptor, workspace, userData, home, availableSkills, emit, intent })
+  return { subRunId, ok: true, status: 'queued' }
+}
+
+async function executeDelegateSubRun({ kind, params, parentRunId, sessionId, provider, profile, subRunId, permissions, browserDescriptor, workspace, userData, home, availableSkills, emit, intent }) {
+  const adapter = adapters[provider]
+  const profileEnv = profile ? profileEnvOverlay(profile) : {}
+  const browserOptions = browserMcpLaunchOptions(provider, browserDescriptor, subRunId, permissions.env)
+  const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
+  const mergedArgs = [...permissions.args, ...browserOptions.args]
+  let worktreeInfo = null
+  if (kind === 'agent') {
+    // 6.4: Fail-closed — worktree error does NOT fall back to live workspace
+    try {
+      worktreeInfo = await createWorktree(userData, sessionId || 'delegate', subRunId, workspace)
+    } catch (error) {
+      worktreeInfo = { ok: false, error: error.message, path: null }
+    }
+    if (!worktreeInfo.ok) {
+      const record = delegateRuns.get(subRunId)
+      if (record) { record.status = 'failed'; record.finishedAt = Date.now(); record.result = { outcome: 'blocked', error: `Worktree failed: ${worktreeInfo.error}` } }
+      writeReceipt(userData, subRunId, normalizeReceipt({ runId: subRunId, sessionId, provider, profileId: profile ? profile.id : '', mode: 'delegate', intent, prompt: params.prompt, exitCode: -1, outcome: 'blocked', parentRunId, warnings: [`Worktree failed: ${worktreeInfo.error}`] }))
+      if (emit) emit('delegate.subrun_completed', { parentRunId, subRunId, kind, outcome: 'blocked', exitCode: -1 })
+      return
+    }
+  }
+  const effectiveCwd = worktreeInfo?.ok && worktreeInfo.path ? worktreeInfo.path : workspace
+  const basePrompt = globalSkillPrompt(params.prompt, availableSkills, readSettings().defaultGlobalSkills)
+  const intentPrefix = planPrefix(intent)
+  const prompt = withBrowserAwarenessPrompt(intentPrefix + basePrompt)
+  // 6.4: Update status to 'running'
+  const record = delegateRuns.get(subRunId)
+  if (record) record.status = 'running'
+  const child = spawn(adapter.executable, adapter.buildArgs({ workspace: effectiveCwd, model: params.model || '', reasoning: params.reasoning || '', agent: params.agent || 'default', prompt, attachments: params.attachments || [], permissionArgs: mergedArgs }), {
+    cwd: effectiveCwd, env: mergedEnv, windowsHide: true, shell: false,
+  })
+  child.stdin.end()
+  running.set(subRunId, { child, cleanup: browserOptions.cleanup, envelope: worktreeInfo?.ok ? { isolated: true, worktreeInfo, workspace } : null })
+  let rawOutput = ''
+  child.stdout.on('data', (chunk) => { rawOutput += chunk.toString() })
+  child.stderr.on('data', (chunk) => { rawOutput += chunk.toString() })
+  child.on('error', (error) => { rawOutput += error.message })
+  child.on('close', async (code) => {
+    running.delete(subRunId)
+    try { await browserOptions.cleanup() } catch {}
+    let patch = ''
+    if (worktreeInfo?.ok && worktreeInfo.path) {
+      try { patch = await captureWorktreeDiff(worktreeInfo.path) } catch {}
+      try { await removeWorktree(workspace, worktreeInfo.path) } catch {}
+    }
+    const summary = extractRunSummary(provider, rawOutput)
+    if (summary) writeSummary(userData, subRunId, summary)
+    if (patch) writePatch(userData, subRunId, patch)
+    const exitCode = Number.isFinite(code) ? code : -1
+    const outcome = exitCode === 0 ? 'success' : 'blocked'
+    const usage = extractTokenUsage(provider, rawOutput)
+    const costEstimate = estimateRunCost(provider, params.model, usage)
+    if (sessionId) {
+      try {
+        appendSpendEntry(userData, sessionId, {
+          runId: subRunId, provider, profileId: profile ? profile.id : '', model: params.model,
+          cost: costEstimate.cost, costType: costEstimate.type, unverifiable: costEstimate.unverifiable,
+          usage: usage || {}, parentRunId,
+        })
+      } catch {}
+    }
+    writeReceipt(userData, subRunId, normalizeReceipt({
+      runId: subRunId, sessionId, provider, profileId: profile ? profile.id : '', mode: 'delegate', intent,
+      prompt: params.prompt, exitCode, outcome, parentRunId,
+      filesChanged: [], startedAt: delegateRuns.get(subRunId)?.startedAt || Date.now(), finishedAt: Date.now(),
+    }))
+    writeManifest(userData, subRunId, { kind: 'delegate' })
+    const record = delegateRuns.get(subRunId)
+    if (record) { record.status = exitCode === 0 ? 'completed' : 'failed'; record.finishedAt = Date.now(); record.result = { summary, patch, outcome, exitCode } }
+    if (emit) emit('delegate.subrun_completed', { parentRunId, subRunId, kind, outcome, exitCode })
+  })
+}
+
+// 6.4: Recover delegate run status from artifacts (after restart)
+function recoverDelegateRunStatus(subRunId, userData) {
+  const receipt = readReceipt(userData, subRunId)
+  if (!receipt) return null
+  const status = receipt.outcome === 'success' ? 'completed' : receipt.outcome === 'blocked' ? 'failed' : 'completed'
+  return { state: status, kind: receipt.mode, provider: receipt.provider, startedAt: receipt.startedAt, finishedAt: receipt.finishedAt, result: { outcome: receipt.outcome, exitCode: receipt.exitCode } }
+}
+
 ipcMain.handle('agent:run', async (event, request) => {
   const adapter = adapters[request.provider]
   if (!adapter) throw new Error(`Unknown provider: ${request.provider}`)
@@ -1028,8 +1300,11 @@ ipcMain.handle('agent:run', async (event, request) => {
   const mode = request.mode === 'resume' || request.mode === 'restart' || request.mode === 'retry' ? request.mode : 'run'
   const intent = request.intent === 'plan' || request.intent === 'ask' ? request.intent : 'agent'
   const repairConfig = normalizeRepairConfig(request.repair)
-  const isolated = Boolean(request.isolated) && intent !== 'plan' && mode === 'run'
-  const changesBeforeRun = await readWorkspaceChanges(workspace)
+  const delegateConfig = normalizeDelegateConfig(request.delegate)
+  const readOnly = isReadOnlyIntent(intent)
+  const isolated = Boolean(request.isolated) && !readOnly && mode === 'run'
+  const budgetConfig = normalizeBudget(request.maxUsd)
+  const gatesConfig = normalizeGatesConfig(request.gates)
   const availableSkills = listSkills(workspace, app.getPath('home'), getCodexHome())
 
   const home = app.getPath('home')
@@ -1041,34 +1316,124 @@ ipcMain.handle('agent:run', async (event, request) => {
 
   const sessionId = request.sessionId || ''
   const profileRef = profile ? profile.id : ''
-  // Keep AgentDock's lane data durable without replacing the CLI's native home.
-  // HOME/USERPROFILE also contain provider credentials and configuration. Pointing
-  // them at a newly-created lane made the default account appear logged out (most
-  // visibly OpenCode, whose auth.json lives below ~/.local/share/opencode).
   if (sessionId) ensureLaneDir(userData, sessionId, request.provider, profileRef)
 
-  let runCwd = workspace
-  let worktreeInfo = null
-  if (isolated) {
-    try {
-      worktreeInfo = await createWorktree(userData, sessionId || 'standalone', runId, workspace)
-      if (worktreeInfo.ok) {
-        runCwd = worktreeInfo.path
-      } else {
-        worktreeInfo = { ok: false, error: worktreeInfo.error, path: null }
-      }
-    } catch (error) {
-      worktreeInfo = { ok: false, error: error.message, path: null }
+  // 5.5: Budget preflight — zero budget blocks any run with potential cost
+  if (budgetConfig.enabled && budgetConfig.zero) {
+    const costModel = estimateRunCost(request.provider, request.model, null)
+    if (costModel.unverifiable || costModel.cost > 0) {
+      const runId = generateRunId()
+      ensureRunDir(userData, runId)
+      writeReceipt(userData, runId, normalizeReceipt({
+        runId, sessionId, provider: request.provider, profileId: profileRef, mode, intent,
+        prompt: request.prompt || '', exitCode: -1, outcome: 'blocked',
+        filesChanged: [], startedAt: Date.now(), finishedAt: Date.now(),
+        budget: { maxUsd: 0, reason: 'zero_budget_blocks_paid_runs' },
+        warnings: ['Budget set to $0 — run blocked because provider may incur cost'],
+      }))
+      return { runId, blocked: true, reason: 'zero_budget' }
+    }
+  }
+  if (budgetConfig.enabled && !budgetConfig.omitted) {
+    const spend = sessionId ? sessionSpend(userData, sessionId) : 0
+    const headroom = hasBudgetHeadroom(spend, budgetConfig)
+    if (!headroom.allowed) {
+      const runId = generateRunId()
+      ensureRunDir(userData, runId)
+      writeReceipt(userData, runId, normalizeReceipt({
+        runId, sessionId, provider: request.provider, profileId: profileRef, mode, intent,
+        prompt: request.prompt || '', exitCode: -1, outcome: 'exhausted_overshoot',
+        filesChanged: [], startedAt: Date.now(), finishedAt: Date.now(),
+        budget: { maxUsd: budgetConfig.maxUsd, spend, reason: headroom.reason || 'budget_exhausted' },
+      }))
+      return { runId, blocked: true, reason: 'budget_exhausted' }
     }
   }
 
-  const permissions = permissionLaunchOptions(request.provider, request.permissionMode, { ...process.env, ...profileEnv })
-  const descriptor = browserMcpReady ? browserMcp.descriptor() : null
-  const runId = crypto.randomUUID()
-  let browserOptions
-  const baseRequest = { ...request, workspace: runCwd, permissionArgs: permissions.args }
-  let child
+  // 5.1: Generate runId BEFORE any run setup
+  const runId = generateRunId()
+  const changesBeforeRun = readOnly ? null : await readWorkspaceChanges(workspace)
+  const fingerprintBefore = readOnly ? await workspaceFingerprint(workspace) : null
 
+  // 5.2: Prepare envelope — fail-closed for isolated
+  const envelope = await prepareEnvelope({ isolated, intent, userData, sessionId, runId, workspace })
+  if (envelope.failClosed) {
+    ensureRunDir(userData, runId)
+    writeReceipt(userData, runId, normalizeReceipt({
+      runId, sessionId, provider: request.provider, profileId: profileRef, mode, intent,
+      prompt: request.prompt || '', exitCode: -1, outcome: 'blocked',
+      filesChanged: [], startedAt: Date.now(), finishedAt: Date.now(),
+      warnings: [`Isolated envelope setup failed: ${envelope.error}`],
+    }))
+    return { runId, blocked: true, reason: 'envelope_failed' }
+  }
+  const runCwd = envelope.cwd || workspace
+
+  // 5.3: Enforce read-only permissions for ask/plan
+  const permissions = effectivePermissionOptions(request.provider, intent, request.permissionMode, { ...process.env, ...profileEnv })
+  const descriptor = browserMcpReady ? browserMcp.descriptor() : null
+  let browserOptions
+  let delegateMcp = null
+  let delegateDescriptor = null
+  // 5.3: No delegate for plan/ask
+  if (delegateConfig.enabled && mode === 'run' && !readOnly && !request.parentRunId) {
+    try {
+      const sessionSpendUsd = sessionId ? sessionSpend(userData, sessionId) : 0
+      const policy = buildPolicy(delegateConfig, { maxUsd: budgetConfig.maxUsd, sessionSpendUsd })
+      const emitDelegate = (type, data = {}) => {
+        if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId, type: 'stdout', data: JSON.stringify({ type: `agentdock.${type}`, runId, ...data }) })
+      }
+      delegateMcp = createDelegateMcp({
+        policy,
+        context: { estimatedCostPerCandidate: () => null },
+        spawnSubRun: async (kind, params) => runDelegateSubRun({
+          kind, params, parentRunId: runId, sessionId, parentProvider: request.provider, parentProfileId: profileRef,
+          workspace, userData, home, availableSkills, emit: emitDelegate, policy: { allowedProviders: [request.provider] },
+        }),
+        statusOf: (subRunId) => {
+          const record = delegateRuns.get(subRunId)
+          if (record) return { state: record.status, kind: record.kind, provider: record.provider, startedAt: record.startedAt, finishedAt: record.finishedAt }
+          // 6.4: Recover from artifacts after restart
+          return recoverDelegateRunStatus(subRunId, userData)
+        },
+        resultOf: (subRunId) => {
+          const record = delegateRuns.get(subRunId)
+          if (record && record.status !== 'running' && record.status !== 'queued') return record.result || null
+          // 6.4: Recover from artifacts
+          const recovered = recoverDelegateRunStatus(subRunId, userData)
+          if (!recovered || recovered.state === 'running' || recovered.state === 'queued') return null
+          return recovered.result || null
+        },
+      })
+      await delegateMcp.start()
+      delegateDescriptor = delegateMcp.descriptor()
+      delegateServers.set(runId, delegateMcp)
+    } catch (error) {
+      console.error('[agentdock] Failed to start delegate MCP:', error && error.message ? error.message : error)
+      delegateMcp = null
+      delegateDescriptor = null
+    }
+  }
+  const baseRequest = { ...request, workspace: runCwd, permissionArgs: permissions.args }
+  ensureRunDir(userData, runId)
+  const startedAt = Date.now()
+  const emit = (type, data = '') => {
+    if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId, type, data })
+  }
+  const appendArtifact = (type, data) => {
+    appendEvents(userData, runId, JSON.stringify({ ts: Date.now(), type, data }))
+  }
+
+  // 5.5: Budget reservation
+  let reservationId = null
+  if (budgetConfig.enabled && !budgetConfig.omitted && sessionId) {
+    const estimatedCost = estimateRunCost(request.provider, request.model, null)
+    const reserveAmount = estimatedCost.unverifiable ? 0.01 : estimatedCost.cost
+    const reservation = reserveBudget(sessionId, reserveAmount, { runId, provider: request.provider })
+    reservationId = reservation.id
+  }
+
+  let child
   if (mode === 'resume') {
     browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
     const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
@@ -1091,8 +1456,11 @@ ipcMain.handle('agent:run', async (event, request) => {
   } else {
     const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
     const intentPrefix = planPrefix(intent)
-    const prompt = withBrowserAwarenessPrompt(intentPrefix + basePrompt)
-    browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
+    const promptBase = withBrowserAwarenessPrompt(intentPrefix + basePrompt)
+    const prompt = delegateConfig.enabled ? withDelegateAwarenessPrompt(promptBase) : promptBase
+    browserOptions = delegateConfig.enabled && delegateDescriptor
+      ? combinedMcpLaunchOptions(request.provider, descriptor, delegateDescriptor, runId, permissions.env)
+      : browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
     const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
     const mergedArgs = [...permissions.args, ...browserOptions.args]
     child = spawn(adapter.executable, adapter.buildArgs({ ...baseRequest, prompt, permissionArgs: mergedArgs }), {
@@ -1103,58 +1471,69 @@ ipcMain.handle('agent:run', async (event, request) => {
     })
   }
   child.stdin.end()
-  running.set(runId, { child, cleanup: browserOptions.cleanup })
-  ensureRunDir(userData, runId)
-  const startedAt = Date.now()
+  const controller = { child, cleanup: browserOptions.cleanup, delegateMcp, envelope: { ...envelope, workspace }, cancelled: false }
+  running.set(runId, controller)
   let rawOutput = ''
-  const repairState = { attempt: 1, gateOutputs: [], cancelled: false, attempts: [] }
+  child.stdout.on('data', (chunk) => { const text = chunk.toString(); emit('stdout', text); appendArtifact('stdout', text); rawOutput += text })
+  child.stderr.on('data', (chunk) => { const text = chunk.toString(); emit('stderr', text); appendArtifact('stderr', text); rawOutput += text })
+  child.on('error', (error) => { emit('error', error.message); appendArtifact('error', error.message); rawOutput += error.message })
 
-  const emit = (type, data = '') => {
-    if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId, type, data })
-  }
-  const appendArtifact = (type, data) => {
-    rawOutput += data
-    appendEvents(userData, runId, JSON.stringify({ ts: Date.now(), type, data }))
-  }
-  child.stdout.on('data', (chunk) => { const text = chunk.toString(); emit('stdout', text); appendArtifact('stdout', text) })
-  child.stderr.on('data', (chunk) => { const text = chunk.toString(); emit('stderr', text); appendArtifact('stderr', text) })
-  child.on('error', (error) => { emit('error', error.message); appendArtifact('error', error.message) })
   child.on('close', async (code) => {
     running.delete(runId)
     try { await browserOptions.cleanup() } catch {}
+    if (delegateMcp) { try { await delegateMcp.stop() } catch {} ; delegateServers.delete(runId) }
+    const exitCode = Number.isFinite(code) ? code : -1
+
+    // 5.3: Read-only intent — verify no workspace mutation
+    if (readOnly && fingerprintBefore) {
+      const fingerprintAfter = await workspaceFingerprint(workspace)
+      if (fingerprintAfter.hash !== fingerprintBefore.hash) {
+        const violationEvent = JSON.stringify({ type: 'agentdock.readonly.violation', runId, intent, before: fingerprintBefore.hash, after: fingerprintAfter.hash })
+        emit('stdout', `\n${violationEvent}\n`)
+        appendArtifact('stdout', `\n${violationEvent}\n`)
+        writeReceipt(userData, runId, normalizeReceipt({
+          runId, sessionId, provider: request.provider, profileId: profileRef, mode, intent,
+          prompt: request.prompt || '', exitCode, outcome: 'blocked',
+          filesChanged: [], startedAt, finishedAt: Date.now(),
+          warnings: ['Read-only intent violated workspace — mutation detected'],
+        }))
+        emit('exit', String(exitCode))
+        return
+      }
+    }
+
+    // 5.2: Capture patch from worktree (includes untracked files now)
     let changes
     let worktreeDiff = ''
-    if (worktreeInfo?.ok && worktreeInfo.path) {
-      try { worktreeDiff = await captureWorktreeDiff(worktreeInfo.path) } catch {}
-      changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
-      if (worktreeDiff) {
-        const applyResult = await applyPatch(workspace, worktreeDiff)
-        const wtEvent = JSON.stringify({ type: 'agentdock.worktree.applied', runId, ok: applyResult.ok, error: applyResult.error || '' })
-        emit('stdout', `\n${wtEvent}\n`)
-        appendArtifact('stdout', `\n${wtEvent}\n`)
-        if (applyResult.ok) {
-          changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
-        }
-      }
-      try { await removeWorktree(workspace, worktreeInfo.path) } catch {}
+    let adopted = false
+    let adoptionConflict = false
+    if (envelope.isolated && envelope.worktreeInfo?.ok && envelope.worktreeInfo.path) {
+      try { worktreeDiff = await captureWorktreeDiff(envelope.worktreeInfo.path) } catch {}
+      changes = []
     } else {
-      changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
+      changes = changesBeforeRun ? workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true)) : []
     }
     if (changes.length) {
-      emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
-      appendArtifact('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
+      const changeEvent = JSON.stringify({ type: 'agentdock.file_changes', changes })
+      emit('stdout', `\n${changeEvent}\n`)
+      appendArtifact('stdout', `\n${changeEvent}\n`)
     }
-    writePatch(userData, runId, buildDiffFromChanges(changes))
-    const gatesConfig = normalizeGatesConfig(request.gates)
+    const patch = envelope.isolated ? worktreeDiff : buildDiffFromChanges(changes)
+    writePatch(userData, runId, patch)
+
+    // 5.2: Gates run BEFORE adopt — including in worktree
     let gateResult = null
-    if (intent !== 'plan' && (gatesConfig.testCommand || gatesConfig.protectedPaths.length)) {
+    let protectedTriggered = false
+    if (!readOnly && (gatesConfig.testCommand || gatesConfig.protectedPaths.length)) {
       const protectedResult = gatesConfig.protectedPaths.length
         ? checkProtectedPaths(changes, gatesConfig.protectedPaths)
         : { triggered: false, matchedPaths: [] }
+      protectedTriggered = protectedResult.triggered
       let testResult = null
+      const gateCwd = envelope.isolated && envelope.worktreeInfo?.ok ? envelope.worktreeInfo.path : workspace
       if (gatesConfig.testCommand && !protectedResult.triggered) {
         emit('stdout', `\n${JSON.stringify({ type: 'agentdock.gates.running', runId, command: gatesConfig.testCommand })}\n`)
-        testResult = await runGateCommand(gatesConfig.testCommand, workspace)
+        testResult = await runGateCommand(gatesConfig.testCommand, gateCwd)
       }
       const evaluation = evaluateGates({ testResult, protectedResult })
       gateResult = {
@@ -1169,82 +1548,107 @@ ipcMain.handle('agent:run', async (event, request) => {
         overall: evaluation.overall,
       }
       writeGateResult(userData, runId, gateResult)
-      const gateEvent = JSON.stringify({ type: 'agentdock.gates.result', runId, overall: gateResult.overall, needsApproval: gateResult.needsApproval, testPassed: gateResult.testPassed, protectedTriggered: gateResult.protectedPaths.triggered })
+      const gateEvent = JSON.stringify({ type: 'agentdock.gates.result', runId, overall: gateResult.overall, needsApproval: gateResult.needsApproval, testPassed: gateResult.testPassed, protectedTriggered })
       emit('stdout', `\n${gateEvent}\n`)
       appendArtifact('stdout', `\n${gateEvent}\n`)
-      if (gateResult.overall === 'test_failed' && (repairConfig.attempts > 1 || repairConfig.untilClean) && !repairState.cancelled) {
-        repairState.gateOutputs.push(gateResult.testStderr || gateResult.testStdout || '')
-        repairState.attempts.push({ exitCode: code, gateOverall: gateResult.overall, gatePassed: false, gateOutput: gateResult.testStderr || gateResult.testStdout || '' })
-        const continueLoop = shouldContinue({
-          attempt: repairState.attempt,
-          attempts: repairConfig.attempts,
-          untilClean: repairConfig.untilClean,
-          lastGatePassed: false,
-          lastGateOutput: gateResult.testStderr || gateResult.testStdout || '',
-          gateOutputs: repairState.gateOutputs,
-          cancelled: repairState.cancelled,
-        })
-        if (continueLoop && repairState.attempt < MAX_ATTEMPTS) {
-          repairState.attempt += 1
-          const repairPromptText = buildRepairPrompt(request.prompt || request.lastPrompt || '', gateResult.testStderr || gateResult.testStdout || '', repairState.attempt)
-          const repairEvent = JSON.stringify(repairEventPayload(runId, repairState.attempt, gateResult.overall, 'gate_failed_retry'))
-          emit('stdout', `\n${repairEvent}\n`)
-          appendArtifact('stdout', `\n${repairEvent}\n`)
-          const repairBasePrompt = globalSkillPrompt(repairPromptText, availableSkills, readSettings().defaultGlobalSkills)
-          const repairPrompt = withBrowserAwarenessPrompt(repairBasePrompt)
-          const repairBrowserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
-          const repairMergedEnv = { ...permissions.env, ...repairBrowserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
-          const repairMergedArgs = [...permissions.args, ...repairBrowserOptions.args]
-          const repairChild = spawn(adapter.executable, adapter.buildArgs({ ...baseRequest, prompt: repairPrompt, permissionArgs: repairMergedArgs }), {
-            cwd: runCwd, env: repairMergedEnv, windowsHide: true, shell: false,
-          })
-          repairChild.stdin.end()
-          running.set(runId, { child: repairChild, cleanup: repairBrowserOptions.cleanup })
-          rawOutput = ''
-          repairChild.stdout.on('data', (chunk) => { const text = chunk.toString(); emit('stdout', text); appendArtifact('stdout', text) })
-          repairChild.stderr.on('data', (chunk) => { const text = chunk.toString(); emit('stderr', text); appendArtifact('stderr', text) })
-          repairChild.on('error', (error) => { emit('error', error.message); appendArtifact('error', error.message) })
-          repairChild.on('close', async (repairCode) => {
-            running.delete(runId)
-            try { await repairBrowserOptions.cleanup() } catch {}
-            const repairChanges = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
-            if (repairChanges.length) {
-              emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes: repairChanges })}\n`)
-              appendArtifact('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes: repairChanges })}\n`)
-            }
-            writePatch(userData, runId, buildDiffFromChanges(repairChanges))
-            let repairGateResult = null
-            if (gatesConfig.testCommand) {
-              const repairTestResult = await runGateCommand(gatesConfig.testCommand, workspace)
-              const repairEvaluation = evaluateGates({ testResult: repairTestResult, protectedResult: { triggered: false, matchedPaths: [] } })
-              repairGateResult = {
-                runId, testCommand: gatesConfig.testCommand,
-                testPassed: repairEvaluation.testPassed, testExitCode: repairTestResult?.exitCode ?? null,
-                testStdout: repairTestResult?.stdout?.slice(0, 5000) || '',
-                testStderr: repairTestResult?.stderr?.slice(0, 5000) || '',
-                protectedPaths: { triggered: false, matchedPaths: [] },
-                needsApproval: repairEvaluation.needsApproval, overall: repairEvaluation.overall,
-              }
-              writeGateResult(userData, runId, repairGateResult)
-              const rGateEvent = JSON.stringify({ type: 'agentdock.gates.result', runId, overall: repairGateResult.overall, needsApproval: repairGateResult.needsApproval, testPassed: repairGateResult.testPassed, protectedTriggered: false })
-              emit('stdout', `\n${rGateEvent}\n`)
-              appendArtifact('stdout', `\n${rGateEvent}\n`)
-            }
-            const repairSummary = extractRunSummary(request.provider, rawOutput)
-            if (repairSummary) writeSummary(userData, runId, repairSummary)
-            const repairExitCode = Number.isFinite(repairCode) ? repairCode : -1
-            let repairOutcome = repairExitCode === 0 ? 'success' : 'blocked'
-            if (repairGateResult && repairGateResult.needsApproval) repairOutcome = 'needs_human'
-            writeAttemptLog(userData, runId, [...repairState.attempts, { exitCode: repairExitCode, gateOverall: repairGateResult?.overall, gatePassed: repairGateResult?.testPassed, gateOutput: repairGateResult?.testStderr || repairGateResult?.testStdout || '' }])
-            const repairOutcomeEvent = JSON.stringify({ type: 'agentdock.run.outcome', runId, outcome: repairOutcome, exitCode: repairExitCode, provider: request.provider, profileId: profileRef, attempt: repairState.attempt })
-            emit('stdout', `\n${repairOutcomeEvent}\n`)
-            appendArtifact('stdout', `\n${repairOutcomeEvent}\n`)
-            emit('exit', String(repairExitCode))
-          })
-          return
+    }
+
+    // 5.2: Adopt ONLY after gates pass and no protected-path trigger
+    if (envelope.isolated && worktreeDiff && !readOnly) {
+      const canAdopt = !gateResult || (gateResult.overall === 'pass' && !gateResult.needsApproval)
+      if (canAdopt) {
+        const adoptResult = await adoptPatch({ workspace, patch: worktreeDiff, baseTreeHash: envelope.baseTreeHash, emit, appendArtifact, runId })
+        adopted = adoptResult.adopted
+        adoptionConflict = Boolean(adoptResult.baseConflict)
+        if (adopted) {
+          changes = changesBeforeRun ? workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true)) : []
         }
       }
     }
+
+    // 5.4: Repair loop — real for/while loop
+    let repairAttempts = []
+    let repairStalled = false
+    let finalOutcome = computeOutcome({ exitCode, gateResult, intent, isolated: envelope.isolated, protectedTriggered, spawnError: null })
+    if (gateResult && gateResult.overall === 'test_failed' && (repairConfig.attempts > 1 || repairConfig.untilClean) && !readOnly) {
+      const stallFingerprints = []
+      const gateOutputs = []
+      const maxAttempts = repairConfig.untilClean ? MAX_ATTEMPTS : Math.max(1, repairConfig.attempts)
+      for (let attemptNum = 2; attemptNum <= maxAttempts; attemptNum++) {
+        if (controller.cancelled) { finalOutcome = 'cancelled'; break }
+        const lastGateOutput = gateResult?.testStderr || gateResult?.testStdout || ''
+        gateOutputs.push(lastGateOutput)
+        const patchHash = contentHash(patch)
+        stallFingerprints.push(stallFingerprint(lastGateOutput, patchHash))
+        const continueDecision = shouldContinue({
+          attempt: attemptNum - 1, attempts: maxAttempts, untilClean: repairConfig.untilClean,
+          lastGatePassed: false, lastGateOutput, gateOutputs, cancelled: controller.cancelled,
+          stallFingerprints, protectedTriggered: false, spawnError: false,
+        })
+        if (!continueDecision.continue) {
+          repairStalled = continueDecision.reason === 'stall'
+          break
+        }
+        const repairPromptText = buildRepairPrompt(request.prompt || request.lastPrompt || '', lastGateOutput, attemptNum)
+        const repairEvent = JSON.stringify(repairEventPayload(runId, attemptNum, gateResult.overall, 'gate_failed_retry'))
+        emit('stdout', `\n${repairEvent}\n`)
+        appendArtifact('stdout', `\n${repairEvent}\n`)
+        const repairBasePrompt = globalSkillPrompt(repairPromptText, availableSkills, readSettings().defaultGlobalSkills)
+        const repairPrompt = withBrowserAwarenessPrompt(repairBasePrompt)
+        const repairBrowserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
+        const repairMergedEnv = { ...permissions.env, ...repairBrowserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
+        const repairMergedArgs = [...permissions.args, ...repairBrowserOptions.args]
+        const repairChild = spawn(adapter.executable, adapter.buildArgs({ ...baseRequest, prompt: repairPrompt, permissionArgs: repairMergedArgs }), {
+          cwd: runCwd, env: repairMergedEnv, windowsHide: true, shell: false,
+        })
+        repairChild.stdin.end()
+        running.set(runId, { ...controller, child: repairChild })
+        let repairRaw = ''
+        await new Promise((resolve) => {
+          repairChild.stdout.on('data', (chunk) => { const text = chunk.toString(); emit('stdout', text); appendArtifact('stdout', text); repairRaw += text })
+          repairChild.stderr.on('data', (chunk) => { const text = chunk.toString(); emit('stderr', text); appendArtifact('stderr', text); repairRaw += text })
+          repairChild.on('error', (error) => { emit('error', error.message); appendArtifact('error', error.message); repairRaw += error.message })
+          repairChild.on('close', () => resolve())
+        })
+        running.delete(runId)
+        try { await repairBrowserOptions.cleanup() } catch {}
+        writeAttemptArtifact(userData, runId, attemptNum, 'events.jsonl', repairRaw)
+        const repairChanges = changesBeforeRun ? workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true)) : []
+        const repairPatch = envelope.isolated ? await captureWorktreeDiff(envelope.worktreeInfo.path).catch(() => '') : buildDiffFromChanges(repairChanges)
+        writeAttemptArtifact(userData, runId, attemptNum, 'patch.diff', repairPatch)
+        let repairGateResult = null
+        if (gatesConfig.testCommand) {
+          const gateCwd = envelope.isolated && envelope.worktreeInfo?.ok ? envelope.worktreeInfo.path : workspace
+          const repairTestResult = await runGateCommand(gatesConfig.testCommand, gateCwd)
+          const repairEvaluation = evaluateGates({ testResult: repairTestResult, protectedResult: { triggered: false, matchedPaths: [] } })
+          repairGateResult = {
+            runId, testCommand: gatesConfig.testCommand,
+            testPassed: repairEvaluation.testPassed, testExitCode: repairTestResult?.exitCode ?? null,
+            testStdout: repairTestResult?.stdout?.slice(0, 5000) || '',
+            testStderr: repairTestResult?.stderr?.slice(0, 5000) || '',
+            protectedPaths: { triggered: false, matchedPaths: [] },
+            needsApproval: repairEvaluation.needsApproval, overall: repairEvaluation.overall,
+          }
+          writeGateResult(userData, runId, repairGateResult)
+          const rGateEvent = JSON.stringify({ type: 'agentdock.gates.result', runId, overall: repairGateResult.overall, needsApproval: repairGateResult.needsApproval, testPassed: repairGateResult.testPassed, protectedTriggered: false })
+          emit('stdout', `\n${rGateEvent}\n`)
+          appendArtifact('stdout', `\n${rGateEvent}\n`)
+        }
+        repairAttempts.push({ exitCode: 0, gateOverall: repairGateResult?.overall, gatePassed: repairGateResult?.testPassed, gateOutput: repairGateResult?.testStderr || repairGateResult?.testStdout || '', attemptNumber: attemptNum })
+        if (repairGateResult?.testPassed) {
+          finalOutcome = 'success'
+          if (envelope.isolated && repairPatch) {
+            const adoptResult = await adoptPatch({ workspace, patch: repairPatch, baseTreeHash: envelope.baseTreeHash, emit, appendArtifact, runId })
+            adopted = adoptResult.adopted
+            adoptionConflict = Boolean(adoptResult.baseConflict)
+          }
+          break
+        }
+        gateResult = repairGateResult || gateResult
+      }
+      writeAttemptLog(userData, runId, [{ exitCode, gateOverall: gateResult?.overall, gatePassed: gateResult?.testPassed, gateOutput: gateResult?.testStderr || gateResult?.testStdout || '', attemptNumber: 1 }, ...repairAttempts])
+    }
+
     const summary = extractRunSummary(request.provider, rawOutput)
     if (summary) writeSummary(userData, runId, summary)
     let planResult = null
@@ -1252,44 +1656,74 @@ ipcMain.handle('agent:run', async (event, request) => {
       const openQuestions = parseOpenQuestions(summary)
       const readiness = classifyPlanReadiness(summary, openQuestions)
       planResult = writePlanContract(userData, sessionId, summary, [])
+      writePlanArtifact(userData, runId, summary)
       const planEvent = JSON.stringify({ type: 'agentdock.plan.result', runId, sessionId, readiness, openQuestions, hash: planResult?.hash || '', planPath: planResult?.path || '' })
       emit('stdout', `\n${planEvent}\n`)
       appendArtifact('stdout', `\n${planEvent}\n`)
     }
-    const exitCode = Number.isFinite(code) ? code : -1
-    let outcome = exitCode === 0 ? 'success' : 'blocked'
-    if (gateResult && gateResult.needsApproval) outcome = 'needs_human'
-    writeReceipt(userData, runId, normalizeReceipt({
-      runId, sessionId, provider: request.provider, profileId: profileRef, mode,
-      intent,
-      prompt: request.prompt || request.lastPrompt || '',
-      exitCode, outcome,
-      filesChanged: changes.map((c) => ({ path: c.path, additions: c.additions, deletions: c.deletions })),
-      startedAt, finishedAt: Date.now(),
-    }))
-    const budgetConfig = normalizeBudget(request.maxUsd)
+
+    // 5.5: Budget settlement — receipt AFTER budget settle
+    let costEvidence = null
+    let budgetInfo = null
     if (sessionId) {
       try {
         const runUsage = extractTokenUsage(request.provider, rawOutput)
         const costEstimate = estimateRunCost(request.provider, request.model, runUsage)
+        costEvidence = costEstimate
         appendSpendEntry(userData, sessionId, {
           runId, provider: request.provider, profileId: profileRef, model: request.model,
           cost: costEstimate.cost, costType: costEstimate.type, unverifiable: costEstimate.unverifiable,
           usage: runUsage || {},
         })
-        if (budgetConfig.enabled) {
+        if (reservationId) settleReservation(sessionId, reservationId, costEstimate.cost)
+        if (budgetConfig.enabled && !budgetConfig.omitted) {
           const spend = sessionSpend(userData, sessionId)
           const budgetCheck = checkBudget(spend, budgetConfig)
-          const budgetEvent = JSON.stringify({ type: 'agentdock.budget.update', runId, sessionId, spend: Math.round(spend * 1_000_000) / 1_000_000, maxUsd: budgetConfig.maxUsd, remaining: budgetCheck.remaining, exceeded: budgetCheck.exceeded })
+          budgetInfo = { maxUsd: budgetConfig.maxUsd, spend: Math.round(spend * 1_000_000) / 1_000_000, remaining: budgetCheck.remaining, exceeded: budgetCheck.exceeded }
+          const budgetEvent = JSON.stringify({ type: 'agentdock.budget.update', runId, sessionId, spend: budgetInfo.spend, maxUsd: budgetConfig.maxUsd, remaining: budgetCheck.remaining, exceeded: budgetCheck.exceeded })
           emit('stdout', `\n${budgetEvent}\n`)
           appendArtifact('stdout', `\n${budgetEvent}\n`)
-          if (budgetCheck.exceeded && outcome === 'success') {
-            outcome = 'exhausted_overshoot'
+          if (budgetCheck.exceeded && finalOutcome === 'success') {
+            finalOutcome = 'exhausted_overshoot'
+          }
+          if (costEstimate.unverifiable && !budgetConfig.omitted) {
+            finalOutcome = 'cost_unverifiable'
           }
         }
       } catch {}
     }
-    const outcomeEvent = JSON.stringify({ type: 'agentdock.run.outcome', runId, outcome, exitCode, provider: request.provider, profileId: profileRef })
+
+    // 5.2: Cleanup envelope
+    let cleanupWarning = null
+    if (envelope.isolated) {
+      const cleanupResult = await cleanupEnvelope({ isolated: envelope.isolated, worktreeInfo: envelope.worktreeInfo, workspace, intent })
+      cleanupWarning = cleanupResult.warning
+    }
+
+    // 5.1: Single terminal receipt
+    const warnings = []
+    if (cleanupWarning) warnings.push(cleanupWarning)
+    if (adoptionConflict) warnings.push('Adoption conflict — base tree changed, patch preserved but not applied')
+    if (repairStalled) warnings.push('Repair loop stalled — same gate failure and patch hash repeated')
+    writeReceipt(userData, runId, normalizeReceipt({
+      runId, sessionId, provider: request.provider, profileId: profileRef, mode,
+      intent,
+      prompt: request.prompt || request.lastPrompt || '',
+      exitCode, outcome: finalOutcome,
+      filesChanged: changes.map((c) => ({ path: c.path, additions: c.additions, deletions: c.deletions })),
+      startedAt, finishedAt: Date.now(),
+      ...(envelope.baseTreeHash ? { baseTreeHash: envelope.baseTreeHash } : {}),
+      ...(cleanupWarning ? { cleanupWarning } : {}),
+      ...(costEvidence ? { cost: costEvidence } : {}),
+      ...(budgetInfo ? { budget: budgetInfo } : {}),
+      ...(warnings.length ? { warnings } : {}),
+      ...(planResult?.hash ? { planHash: planResult.hash } : {}),
+    }))
+    // 6.1: Write telemetry.yaml and manifest.json for terminal artifacts
+    const runUsage = extractTokenUsage(request.provider, rawOutput)
+    writeTelemetry(userData, runId, { provider: request.provider, model: request.model, intent, outcome: finalOutcome, exitCode, startedAt, finishedAt: Date.now(), usage: runUsage, cost: costEvidence })
+    writeManifest(userData, runId, { kind: intent === 'plan' ? 'plan' : 'run' })
+    const outcomeEvent = JSON.stringify({ type: 'agentdock.run.outcome', runId, outcome: finalOutcome, exitCode, provider: request.provider, profileId: profileRef })
     emit('stdout', `\n${outcomeEvent}\n`)
     appendArtifact('stdout', `\n${outcomeEvent}\n`)
     emit('exit', String(exitCode))
@@ -1306,13 +1740,18 @@ ipcMain.handle('agent:run', async (event, request) => {
         }
       } catch {}
     }
+    // 6.5: Rotation only by recognized typed vendor-limit signal, not by non-zero exit code
     if (exitCode !== 0 && profile && readSettings().limitAction === 'rotate') {
       try {
         const providerLimits = request.provider === 'codex' ? await getCodexRateLimits({ ...process.env, ...profileEnv }) : request.provider === 'claude' ? await getClaudeRateLimits({ ...process.env, ...profileEnv }) : null
-        if (providerLimits && isProfileExhausted(providerLimits)) {
+        // 6.5: Only rotate on typed vendor-limit signal
+        if (providerLimits && isTypedVendorLimitSignal(providerLimits, exitCode)) {
           const allProfiles = mergeProfiles(readProfiles(app.getPath('userData'), app.getPath('home')), detectDefaultProfiles(app.getPath('home')))
           const candidate = nextReadyProfile(allProfiles, request.provider, profile.id)
-          if (candidate) emit('stdout', `\n${JSON.stringify({ type: 'agentdock.profile_rotated', from: profile.id, to: candidate.id, reason: 'quota_exhausted' })}\n`)
+          if (candidate) {
+            emit('stdout', `\n${JSON.stringify({ type: 'agentdock.route.profile.rotated', from: profile.id, to: candidate.id, reason: 'quota_exhausted', signal: 'typed_vendor_limit' })}\n`)
+            appendArtifact('stdout', `\n${JSON.stringify({ type: 'agentdock.route.profile.rotated', from: profile.id, to: candidate.id, reason: 'quota_exhausted', signal: 'typed_vendor_limit' })}\n`)
+          }
         }
       } catch {}
     }
@@ -1348,9 +1787,18 @@ async function runCouncilDraft({ provider, request, workspace, userData, home, a
       running.delete(draftRunId)
       try { await browserOptions.cleanup() } catch {}
       const summary = extractRunSummary(provider, rawOutput)
-      const draftPath = writeDraft(userData, sessionId, provider, summary)
-      emit('draft_completed', { councilId, provider, ok: code === 0, path: draftPath })
-      resolve({ provider, ok: code === 0, summary, path: draftPath })
+      const draftResult = writeDraft(userData, sessionId, provider, summary)
+      const draftPath = draftResult?.path || null
+      const draftHash = draftResult?.hash || ''
+      // 6.3: Write draft receipt as self-contained child run
+      writeReceipt(userData, draftRunId, normalizeReceipt({
+        runId: draftRunId, sessionId, provider, mode: 'council', intent: 'plan',
+        prompt: request.prompt || '', exitCode: code, outcome: code === 0 ? 'success' : 'blocked',
+        filesChanged: [], startedAt: Date.now(), finishedAt: Date.now(), parentRunId: councilId,
+        ...(draftHash ? { draftHash } : {}),
+      }))
+      emit('draft_completed', { councilId, provider, ok: code === 0, path: draftPath, hash: draftHash })
+      resolve({ provider, ok: code === 0, summary, path: draftPath, hash: draftHash, runId: draftRunId })
     })
   })
 }
@@ -1367,15 +1815,28 @@ ipcMain.handle('agent:council', async (event, request) => {
   const availableSkills = listSkills(workspace, home, getCodexHome())
   const councilId = crypto.randomUUID()
   ensureCouncilDir(userData, sessionId)
-  const installedProviders = Object.keys(adapters)
-  const councilProviders = councilConfig.providers.length
-    ? councilConfig.providers.filter((p) => installedProviders.includes(p))
-    : installedProviders
-  if (councilProviders.length < 2) throw new Error('Council requires at least 2 providers')
+  ensureRunDir(userData, councilId)
+  // 6.3: Preflight — check CLI availability for all council providers
+  const installedProviders = []
+  for (const [id, adapter] of Object.entries(adapters)) {
+    const detected = await commandExists(adapter.executable)
+    if (detected.installed) installedProviders.push(id)
+  }
+  // 6.3: Show partial council instead of silent substitution
+  const selection = selectCouncilProviders(councilConfig.providers, installedProviders)
+  if (!selection.providers) {
+    writeReceipt(userData, councilId, normalizeReceipt({ runId: councilId, sessionId, mode: 'council', intent: 'plan', outcome: 'blocked', exitCode: -1, warnings: [`Council requires at least 2 available providers, got ${installedProviders.length}`] }))
+    if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId: councilId, type: 'stdout', data: JSON.stringify(councilEventPayload(sessionId, 'failed', { councilId, reason: 'insufficient_providers', missing: selection.missing })) })
+    return { councilId, drafts: [], mergedPlan: null, openQuestions: [], readiness: 'unverified', reason: 'insufficient_providers' }
+  }
+  const councilProviders = selection.providers
+  if (selection.missing.length) {
+    if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId: councilId, type: 'stdout', data: JSON.stringify(councilEventPayload(sessionId, 'partial_council', { councilId, available: councilProviders, missing: selection.missing })) })
+  }
   const emit = (type, data = {}) => {
     if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId: councilId, type: 'stdout', data: JSON.stringify(councilEventPayload(sessionId, type, { councilId, ...data })) })
   }
-  emit('started', { providers: councilProviders })
+  emit('started', { providers: councilProviders, partial: selection.missing.length > 0 })
   const draftPromises = councilProviders.map((provider) =>
     runCouncilDraft({ provider, request, workspace, userData, home, availableSkills, sessionId, emit, councilId })
   )
@@ -1383,16 +1844,20 @@ ipcMain.handle('agent:council', async (event, request) => {
   emit('all_drafts_completed', { count: drafts.filter((d) => d.ok).length })
   const successfulDrafts = drafts.filter((d) => d.ok && d.path)
   if (!successfulDrafts.length) {
+    writeReceipt(userData, councilId, normalizeReceipt({ runId: councilId, sessionId, mode: 'council', intent: 'plan', outcome: 'blocked', exitCode: -1, warnings: ['No successful drafts'] }))
     emit('failed', { reason: 'no_successful_drafts' })
     return { councilId, drafts, mergedPlan: null, openQuestions: [], readiness: 'unverified' }
   }
   const mergeProvider = councilProviders[0]
   const mergeAdapter = adapters[mergeProvider]
   if (!mergeAdapter) {
+    writeReceipt(userData, councilId, normalizeReceipt({ runId: councilId, sessionId, mode: 'council', intent: 'plan', outcome: 'blocked', exitCode: -1, warnings: ['No merge adapter'] }))
     emit('failed', { reason: 'no_merge_adapter' })
     return { councilId, drafts, mergedPlan: null, openQuestions: [], readiness: 'unverified' }
   }
+  // 6.3: Merge-run gets only absolute references to immutable draft artifacts + hashes
   const draftPaths = successfulDrafts.map((d) => d.path)
+  const draftHashes = successfulDrafts.map((d) => ({ provider: d.provider, hash: d.hash, path: d.path }))
   const mergePrompt = buildMergePrompt(request.prompt, draftPaths)
   const mergePermissions = permissionLaunchOptions(mergeProvider, request.permissionMode, { ...process.env })
   const mergeDescriptor = browserMcpReady ? browserMcp.descriptor() : null
@@ -1415,17 +1880,34 @@ ipcMain.handle('agent:council', async (event, request) => {
       resolve(extractRunSummary(mergeProvider, mergeRaw))
     })
   })
+  // 6.3: Merge failure does not overwrite last accepted plan revision
+  if (!mergedPlan) {
+    const existingContract = readPlanContract(userData, sessionId)
+    writeReceipt(userData, councilId, normalizeReceipt({ runId: councilId, sessionId, mode: 'council', intent: 'plan', outcome: 'blocked', exitCode: -1, warnings: ['Merge produced no output'], ...(existingContract ? { preservedPlanHash: existingContract.hash } : {}) }))
+    emit('merge_failed', { reason: 'no_output', preservedPlan: Boolean(existingContract) })
+    emit('exit', { councilId })
+    return { councilId, drafts, mergedPlan: null, openQuestions: [], readiness: 'unverified', preservedPlan: Boolean(existingContract) }
+  }
+  // 6.3: Open Questions merged with deduplication by stable id
+  const draftOpenQuestions = successfulDrafts.map((d) => parseOpenQuestions(d.summary || ''))
+  const mergedDraftQuestions = mergeOpenQuestions(draftOpenQuestions)
   const openQuestions = parseOpenQuestions(mergedPlan)
-  const readiness = classifyPlanReadiness(mergedPlan, openQuestions)
+  const allOpenQuestions = mergeOpenQuestions([mergedDraftQuestions, openQuestions])
+  const readiness = classifyPlanReadiness(mergedPlan, allOpenQuestions)
   const planContract = writePlanContract(userData, sessionId, mergedPlan, [])
-  emit('merge_completed', { readiness, openQuestionCount: openQuestions.length, hash: planContract?.hash || '' })
+  emit('merge_completed', { readiness, openQuestionCount: allOpenQuestions.length, hash: planContract?.hash || '', draftHashes })
   emit('exit', { councilId })
-  return { councilId, drafts, mergedPlan, openQuestions, readiness, hash: planContract?.hash || '', planPath: planContract?.path || '' }
+  writeReceipt(userData, councilId, normalizeReceipt({ runId: councilId, sessionId, mode: 'council', intent: 'plan', outcome: 'success', exitCode: 0, ...(planContract ? { planHash: planContract.hash } : {}) }))
+  writeManifest(userData, councilId, { kind: 'council' })
+  return { councilId, drafts, mergedPlan, openQuestions: allOpenQuestions, readiness, hash: planContract?.hash || '', planPath: planContract?.path || '' }
 })
 
-async function runRaceCandidate({ event, raceId, candidateId, provider, profileId, request, workspace, userData, home, availableSkills, emit }) {
+async function runRaceCandidate({ event, raceId, candidateId, provider, profileId, request, workspace, userData, home, availableSkills, emit, gatesConfig }) {
   const adapter = adapters[provider]
-  if (!adapter) return normalizeCandidate({ candidateId, provider, exitCode: -1, patch: '', summary: 'Adapter not found' })
+  if (!adapter) return normalizeCandidate({ candidateId, provider, exitCode: -1, patch: '', summary: 'Adapter not found', failClosed: true, spawnError: 'adapter_not_found' })
+  // 6.2: Preflight — check CLI availability
+  const detected = await commandExists(adapter.executable)
+  if (!detected.installed) return normalizeCandidate({ candidateId, provider, exitCode: -1, patch: '', summary: `CLI not installed: ${adapter.executable}`, failClosed: true, spawnError: 'cli_not_installed' })
   const profiles = mergeProfiles(readProfiles(userData, home), detectDefaultProfiles(home))
   const profile = findProfile(profiles, profileId) || null
   const profileEnv = profile ? profileEnvOverlay(profile) : {}
@@ -1435,16 +1917,20 @@ async function runRaceCandidate({ event, raceId, candidateId, provider, profileI
   const browserOptions = browserMcpLaunchOptions(provider, descriptor, candidateRunId, permissions.env)
   const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
   const mergedArgs = [...permissions.args, ...browserOptions.args]
+  // 6.2: Fail-closed envelope — candidate MUST run in worktree
   const wtResult = await createWorktree(userData, request.sessionId || 'race', candidateRunId, workspace)
-  const runCwd = wtResult.ok ? wtResult.path : workspace
+  if (!wtResult.ok) return normalizeCandidate({ candidateId, provider, exitCode: -1, patch: '', summary: `Worktree failed: ${wtResult.error}`, failClosed: true, spawnError: 'worktree_failed' })
+  const runCwd = wtResult.path
+  const baseTreeHash = wtResult.baseTreeHash || null
   const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
   const prompt = withBrowserAwarenessPrompt(basePrompt)
+  ensureRunDir(userData, candidateRunId)
   return new Promise((resolve) => {
     const child = spawn(adapter.executable, adapter.buildArgs({ workspace: runCwd, model: request.model, reasoning: request.reasoning, agent: request.agent || 'default', prompt, attachments: request.attachments || [], permissionArgs: mergedArgs }), {
       cwd: runCwd, env: mergedEnv, windowsHide: true, shell: false,
     })
     child.stdin.end()
-    running.set(candidateRunId, { child, cleanup: browserOptions.cleanup })
+    running.set(candidateRunId, { child, cleanup: browserOptions.cleanup, envelope: { isolated: true, worktreeInfo: wtResult, workspace } })
     let rawOutput = ''
     child.stdout.on('data', (chunk) => { const text = chunk.toString(); rawOutput += text; emit('candidate_stdout', { candidateId, text }) })
     child.stderr.on('data', (chunk) => { const text = chunk.toString(); rawOutput += text; emit('candidate_stderr', { candidateId, text }) })
@@ -1455,16 +1941,33 @@ async function runRaceCandidate({ event, raceId, candidateId, provider, profileI
       let patch = ''
       if (wtResult.ok && wtResult.path) {
         try { patch = await captureWorktreeDiff(wtResult.path) } catch {}
-        try { await removeWorktree(workspace, wtResult.path) } catch {}
-      } else {
-        const changes = await readWorkspaceChanges(workspace, true)
-        patch = buildDiffFromChanges([...changes.values()])
       }
       const summary = extractRunSummary(provider, rawOutput)
       const exitCode = Number.isFinite(code) ? code : -1
-      const candidate = normalizeCandidate({ candidateId, provider, profileId, runId: candidateRunId, exitCode, patch, summary, filesChanged: [] })
+      // 6.2: Deterministic gates for candidate (inside worktree)
+      let gateResult = null
+      if (gatesConfig?.testCommand && exitCode === 0 && patch) {
+        const testResult = await runGateCommand(gatesConfig.testCommand, runCwd)
+        const evaluation = evaluateGates({ testResult, protectedResult: { triggered: false, matchedPaths: [] } })
+        gateResult = {
+          runId: candidateRunId, testCommand: gatesConfig.testCommand,
+          testPassed: evaluation.testPassed, testExitCode: testResult?.exitCode ?? null,
+          testStdout: testResult?.stdout?.slice(0, 5000) || '',
+          testStderr: testResult?.stderr?.slice(0, 5000) || '',
+          protectedPaths: { triggered: false, matchedPaths: [] },
+          needsApproval: evaluation.needsApproval, overall: evaluation.overall,
+        }
+      }
+      try { await removeWorktree(workspace, wtResult.path, wtResult.branch) } catch {}
+      const candidate = normalizeCandidate({ candidateId, provider, profileId, runId: candidateRunId, baseTreeHash, exitCode, patch, summary, filesChanged: [], gateResult, reviews: [] })
       writeCandidateArtifact(userData, raceId, candidateId, 'patch.diff', patch)
       writeCandidateArtifact(userData, raceId, candidateId, 'summary.md', summary)
+      if (gateResult) writeCandidateArtifact(userData, raceId, candidateId, 'gate-result.yaml', `overall: ${gateResult.overall}\ntest_passed: ${gateResult.testPassed}\nexit_code: ${gateResult.testExitCode}`)
+      writeReceipt(userData, candidateRunId, normalizeReceipt({
+        runId: candidateRunId, sessionId: request.sessionId || '', provider, profileId: profile ? profile.id : '', mode: 'race', intent: 'agent',
+        prompt: request.prompt || '', exitCode, outcome: exitCode === 0 ? 'success' : 'blocked',
+        filesChanged: [], startedAt: Date.now(), finishedAt: Date.now(), baseTreeHash, parentRunId: raceId,
+      }))
       resolve(candidate)
     })
   })
@@ -1480,63 +1983,88 @@ ipcMain.handle('agent:race', async (event, request) => {
   const availableSkills = listSkills(workspace, home, getCodexHome())
   const raceId = crypto.randomUUID()
   ensureRaceDir(userData, raceId)
-  const installedProviders = Object.entries(adapters).filter(([id]) => {
-    return Object.keys(adapters).includes(id)
-  }).map(([id]) => id)
+  ensureRunDir(userData, raceId)
+  const gatesConfig = normalizeGatesConfig(request.gates)
+  // 6.2: Preflight — check CLI availability for all providers
+  const installedProviders = []
+  for (const [id, adapter] of Object.entries(adapters)) {
+    const detected = await commandExists(adapter.executable)
+    if (detected.installed) installedProviders.push(id)
+  }
+  // 6.2: Fail-closed provider selection — no silent duplication
   const raceProviders = selectProvidersForRace(raceConfig.n, raceConfig.providers, installedProviders)
+  if (!raceProviders) {
+    const available = installedProviders.filter((p) => !raceConfig.providers.length || raceConfig.providers.includes(p))
+    writeReceipt(userData, raceId, normalizeReceipt({ runId: raceId, outcome: 'blocked', exitCode: -1, warnings: [`Not enough providers: requested ${raceConfig.n}, available ${available.length}`] }))
+    if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId: raceId, type: 'stdout', data: JSON.stringify(raceEventPayload(raceId, 'failed', { reason: 'insufficient_providers', requested: raceConfig.n, available: available.length })) })
+    return { raceId, winner: null, reason: 'insufficient_providers', candidates: [] }
+  }
   const emit = (type, data = {}) => {
     if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId: raceId, type: 'stdout', data: JSON.stringify(raceEventPayload(raceId, type, data)) })
   }
   emit('started', { n: raceConfig.n, providers: raceProviders })
   const candidateIds = raceProviders.map((_, i) => `candidate-${i + 1}-${crypto.randomUUID().slice(0, 8)}`)
   const candidatePromises = raceProviders.map((provider, i) =>
-    runRaceCandidate({ event, raceId, candidateId: candidateIds[i], provider, profileId: request.profileId, request, workspace, userData, home, availableSkills, emit })
+    runRaceCandidate({ event, raceId, candidateId: candidateIds[i], provider, profileId: request.profileId, request, workspace, userData, home, availableSkills, emit, gatesConfig })
   )
   const candidates = await Promise.all(candidatePromises)
-  emit('candidates_completed', { count: candidates.length })
+  emit('candidates_completed', { count: candidates.length, eligible: candidates.filter((c) => !c.failClosed && c.exitCode === 0).length })
+  // 6.2: Cross-family review — require minimum 2 distinct families
   if (raceConfig.review) {
     for (const candidate of candidates) {
-      if (!candidate.patch || candidate.exitCode !== 0) continue
-      const reviewProvider = raceProviders.find((p) => p !== candidate.provider) || raceProviders[0]
-      if (!reviewProvider) continue
-      const reviewPrompt = buildReviewPrompt(candidate.patch, candidate.summary, request.prompt)
-      const reviewAdapter = adapters[reviewProvider]
-      if (!reviewAdapter) continue
-      const reviewProfileEnv = {}
-      const reviewPermissions = permissionLaunchOptions(reviewProvider, 'ask', { ...process.env, ...reviewProfileEnv })
-      const reviewDescriptor = browserMcpReady ? browserMcp.descriptor() : null
-      const reviewRunId = crypto.randomUUID()
-      const reviewBrowserOptions = browserMcpLaunchOptions(reviewProvider, reviewDescriptor, reviewRunId, reviewPermissions.env)
-      const reviewEnv = { ...reviewPermissions.env, ...reviewBrowserOptions.env, ...reviewProfileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
-      const reviewArgs = [...reviewPermissions.args, ...reviewBrowserOptions.args]
-      const reviewResult = await new Promise((resolve) => {
-        const reviewChild = spawn(reviewAdapter.executable, reviewAdapter.buildArgs({ workspace, model: '', reasoning: '', agent: 'default', prompt: reviewPrompt, attachments: [], permissionArgs: reviewArgs }), {
-          cwd: workspace, env: reviewEnv, windowsHide: true, shell: false,
+      if (candidate.failClosed || candidate.exitCode !== 0 || !candidate.patch) continue
+      const reviewers = selectReviewersForCandidate(candidate.provider, installedProviders, raceConfig.providers, raceConfig.reviewers)
+      if (!reviewers.length) {
+        emit('review_skipped', { candidateId: candidate.candidateId, reason: 'no_reviewers_available' })
+        continue
+      }
+      for (const reviewProvider of reviewers) {
+        const reviewAdapter = adapters[reviewProvider]
+        if (!reviewAdapter) continue
+        const reviewPrompt = buildReviewPrompt(candidate.patch, candidate.summary, request.prompt)
+        const reviewProfiles = mergeProfiles(readProfiles(userData, home), detectDefaultProfiles(home))
+        const reviewProfile = findProfile(reviewProfiles, null) || null
+        const reviewProfileEnv = reviewProfile ? profileEnvOverlay(reviewProfile) : {}
+        const reviewPermissions = permissionLaunchOptions(reviewProvider, 'ask', { ...process.env, ...reviewProfileEnv })
+        const reviewDescriptor = browserMcpReady ? browserMcp.descriptor() : null
+        const reviewRunId = crypto.randomUUID()
+        const reviewBrowserOptions = browserMcpLaunchOptions(reviewProvider, reviewDescriptor, reviewRunId, reviewPermissions.env)
+        const reviewEnv = { ...reviewPermissions.env, ...reviewBrowserOptions.env, ...reviewProfileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
+        const reviewArgs = [...reviewPermissions.args, ...reviewBrowserOptions.args]
+        const reviewResult = await new Promise((resolve) => {
+          const reviewChild = spawn(reviewAdapter.executable, reviewAdapter.buildArgs({ workspace, model: '', reasoning: '', agent: 'default', prompt: reviewPrompt, attachments: [], permissionArgs: reviewArgs }), {
+            cwd: workspace, env: reviewEnv, windowsHide: true, shell: false,
+          })
+          reviewChild.stdin.end()
+          let reviewRaw = ''
+          reviewChild.stdout.on('data', (chunk) => { reviewRaw += chunk.toString() })
+          reviewChild.stderr.on('data', (chunk) => { reviewRaw += chunk.toString() })
+          reviewChild.on('close', () => {
+            const reviewSummary = extractRunSummary(reviewProvider, reviewRaw)
+            resolve(parseReviewResponse(reviewSummary, reviewProvider))
+          })
         })
-        reviewChild.stdin.end()
-        let reviewRaw = ''
-        reviewChild.stdout.on('data', (chunk) => { reviewRaw += chunk.toString() })
-        reviewChild.stderr.on('data', (chunk) => { reviewRaw += chunk.toString() })
-        reviewChild.on('close', () => {
-          const reviewSummary = extractRunSummary(reviewProvider, reviewRaw)
-          resolve(parseReviewResponse(reviewSummary))
-        })
-      })
-      candidate.review = reviewResult
-      writeCandidateArtifact(userData, raceId, candidate.candidateId, 'review.yaml', `verdict: ${reviewResult.verdict}\nquality: ${reviewResult.quality}\nnotes: ${reviewResult.notes}`)
-      emit('review_completed', { candidateId: candidate.candidateId, verdict: reviewResult.verdict })
+        candidate.reviews = candidate.reviews || []
+        candidate.reviews.push(reviewResult)
+        writeReviewArtifact(userData, raceId, candidate.candidateId, reviewProvider, reviewResult)
+        emit('review_completed', { candidateId: candidate.candidateId, reviewer: reviewProvider, verdict: reviewResult.verdict })
+      }
     }
   }
   for (const candidate of candidates) candidate.score = scoreCandidate(candidate)
-  const arbitration = arbitrate(candidates)
+  // 6.2: Arbitration with minScore, no-winner, tie-break
+  const arbitration = arbitrate(candidates, { minScore: raceConfig.minScore, reviewers: raceConfig.reviewers, review: raceConfig.review })
   writeArbitrationResult(userData, raceId, arbitration)
+  // 6.2: Adopt through safe pipeline — never directly from race handler
   if (raceConfig.autoAdopt && arbitration.winner?.patch) {
-    const applyResult = await applyPatch(workspace, arbitration.winner.patch)
-    emit('adopted', { winner: arbitration.winner.candidateId, provider: arbitration.winner.provider, ok: applyResult.ok, error: applyResult.error || '' })
+    const adoptResult = await adoptPatch({ workspace, patch: arbitration.winner.patch, baseTreeHash: null, emit, appendArtifact: null, runId: raceId })
+    emit('adopted', { winner: arbitration.winner.candidateId, provider: arbitration.winner.provider, ok: adoptResult.ok, error: adoptResult.error || '' })
   }
   emit('completed', { winner: arbitration.winner?.candidateId || 'none', reason: arbitration.reason })
   emit('exit', { raceId })
-  return { raceId, winner: arbitration.winner, scores: arbitration.scores, candidates }
+  writeReceipt(userData, raceId, normalizeReceipt({ runId: raceId, sessionId: request.sessionId || '', mode: 'race', intent: 'agent', outcome: arbitration.winner ? 'success' : 'blocked', exitCode: 0, warnings: arbitration.winner ? [] : ['No winner selected'] }))
+  writeManifest(userData, raceId, { kind: 'race' })
+  return { raceId, winner: arbitration.winner, scores: arbitration.scores, candidates, reason: arbitration.reason }
 })
 
 const killProcessTree = (child) => {
@@ -1557,14 +2085,26 @@ const killProcessTree = (child) => {
 ipcMain.handle('agent:stop', async (_event, runId) => {
   const entry = running.get(runId)
   if (!entry) return false
+  if (entry.cancelled !== undefined) entry.cancelled = true
   killProcessTree(entry.child)
   running.delete(runId)
   try { if (entry.cleanup) await entry.cleanup() } catch {}
+  if (entry.delegateMcp) { try { await entry.delegateMcp.stop() } catch {} ; delegateServers.delete(runId) }
+  if (entry.envelope?.isolated) {
+    try { await cleanupEnvelope({ isolated: entry.envelope.isolated, worktreeInfo: entry.envelope.worktreeInfo, workspace: entry.envelope.workspace, intent: 'agent' }) } catch {}
+  }
   return true
 })
 
 app.whenReady().then(async () => {
   createWindow()
+  // 6.1: Startup recovery — mark interrupted runs and recover orphan worktrees
+  try {
+    const recovered = startupRecovery(app.getPath('userData'))
+    if (recovered.length) console.log(`[agentdock] Recovered ${recovered.length} interrupted run(s)`)
+  } catch (error) {
+    console.error('[agentdock] Startup recovery failed:', error && error.message ? error.message : error)
+  }
   try {
     await browserMcp.start()
     browserMcpReady = true
@@ -1579,11 +2119,13 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', async (event) => {
-  if (browserMcpReady || browserManager.isVisible()) {
+  if (browserMcpReady || browserManager.isVisible() || delegateServers.size > 0) {
     event.preventDefault()
     try { browserAutomation.detach() } catch {}
     try { await browserManager.destroy() } catch {}
     try { await browserMcp.stop() } catch {}
+    for (const [, server] of delegateServers) { try { await server.stop() } catch {} }
+    delegateServers.clear()
     browserMcpReady = false
     app.quit()
   }

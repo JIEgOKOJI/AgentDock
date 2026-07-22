@@ -2,7 +2,7 @@
 
 **One workspace for Codex CLI, Claude Code, and OpenCode.**
 
-AgentDock is a cross-platform Electron desktop app for working with multiple coding-agent CLIs from one interface. It keeps sessions organized by project, carries recent conversation context when you switch providers, and provides shared views for Skills, MCP servers, permissions, Git state, usage, and agent activity.
+AgentDock is a cross-platform Electron desktop app for working with multiple coding-agent CLIs from one interface. It keeps sessions organized by project, carries recent conversation context when you switch providers, chains providers into configurable multi-stage agent pipelines, and provides shared views for Skills, MCP servers, permissions, Git state, usage, and agent activity.
 
 ![AgentDock screenshot](assets/screenshot.png)
 
@@ -13,11 +13,12 @@ AgentDock is a cross-platform Electron desktop app for working with multiple cod
 Coding-agent CLIs usually keep their own history, configuration, and workflows. AgentDock adds a provider-neutral workspace on top of them:
 
 - **Switch providers without starting over.** Recent user and assistant messages, the active Git branch, and attachments are passed to the next CLI as continuation context.
-- **Keep work project-oriented.** Sessions are stored locally and grouped by workspace rather than by provider.
+- **Chain providers into pipelines.** A configurable agent pipeline runs a prompt through multiple stages (formulate → plan → review → implement → verify), each with its own CLI, model, and reasoning level, with autopilot and an automatic fix-round loop.
+- **Keep work project-oriented.** Sessions are stored locally, grouped by workspace, searchable, and deletable from the sidebar.
 - **Use Skills across CLIs.** AgentDock discovers project and global Skills, detects divergent copies, shares them between supported locations, and can inject selected global Skills into runs.
-- **See MCP servers in one place.** Results reported by the installed Codex, Claude, and OpenCode CLIs are merged into a single read-only view, and a unified manager lets you add, edit, sync, and verify servers across all three CLIs from one catalog.
+- **Manage MCP servers in one place.** A single view combines the managed cross-CLI catalog, the built-in AgentDock servers, and everything the installed CLIs report — with per-CLI connection status and one-click sync to all CLIs.
 - **Use one permission selector.** Ask, Auto, and Full modes are translated into provider-specific CLI arguments and configuration.
-- **Follow what the agent is doing.** JSON/JSONL output is normalized into messages, reasoning where available, commands, tool activity, and file-change summaries.
+- **Follow what the agent is doing.** JSON/JSONL output is normalized into a chronological activity timeline — reasoning, intermediate messages, commands, tool activity, and file changes in the order they happened — with live streaming output, markdown rendering, and colored diffs.
 
 ## Features
 
@@ -35,7 +36,7 @@ Each backend adapter converts a common run request into the arguments expected b
 
 ### Portable sessions
 
-Sessions are saved as versioned JSON in Electron's `userData` directory. A session records its workspace, transcript, selected provider and model, reasoning level, agent, permission mode, attachments, Git information, and token usage.
+Sessions are saved as versioned JSON in Electron's `userData` directory. A session records its workspace, transcript, selected provider and model, reasoning level, agent, permission mode, attachments, Git information, and token usage. The sidebar groups sessions by project, supports live search across session titles and project names, and allows deleting sessions (with confirmation; run artifacts stay on disk).
 
 When switching providers, AgentDock builds a **continuation packet** — the delta of transcript turns since the last lane checkpoint is written to a file (`context/THREAD.md`) and referenced by absolute path in the prompt, so the body is not embedded in-line. A cached LLM summary or mechanical one-liners cover older history beyond the byte budget. A typed `session.continuity` event records each lane switch. This makes provider switching practical without depending on one CLI's native session format and avoids re-sending the full transcript on every run.
 
@@ -52,22 +53,32 @@ Three actions in the toolbar's "More" menu recover from a stopped or failed run 
 
 The CLI session id, last user prompt, last exit code, and run-failed flag are persisted alongside the session, so these actions remain available after restarting the app.
 
-### Skills and MCP servers
+### Agent pipelines
+
+The **Pipeline** panel next to the composer chains multiple agents into one workflow. A prompt sent with the pipeline enabled runs through every stage in order, each stage receiving the original request plus the labeled outputs of all previous stages.
+
+- **Free-form stages.** Steps can be added, removed, and reordered. Each step selects a role (Formulate task, Plan, Review, Implement, Verify, or Custom), its own CLI (Codex / Claude Code / OpenCode), model, and reasoning level, plus optional extra instructions. A one-click "classic 5-step template" creates formulate → plan → review → implement → verify.
+- **Role template library.** The default instruction for each role can be overridden in a built-in template editor (Pipeline → Role templates), with per-role reset to default. Overrides are stored in AgentDock settings and apply across workspaces; steps using a customized template are labeled in the editor.
+- **Read-only vs. write stages.** Formulate/plan/review stages run with the read-only `ask` intent; implement and verify stages run with full `agent` intent under the selected permission mode.
+- **Fix-round loop.** A Verify stage must end with `VERDICT: PASS` or `VERDICT: FAIL`. On FAIL the pipeline automatically returns to the last Implement stage with the verifier's notes attached, up to a configurable **Max fix rounds** cap.
+- **Autopilot or step-by-step.** With autopilot on, stages advance automatically; with it off, a progress strip shows the next stage and waits for **Continue**. The strip tracks every stage (done / running / pending), shows fix-round badges, and offers Stop and Retry for failed stages.
+- **Per-workspace persistence.** The pipeline configuration is saved per workspace and survives restarts. Validation blocks sending when a step references an uninstalled CLI or a custom step has no instruction.
+
+Each stage appears in the chat as a normal run — compact stage label, live activity timeline, and final summary — and the pipeline ends with a completion message.
+
+### Skills
 
 AgentDock discovers Skills from supported global and project locations, groups matching copies by name and content hash, and identifies conflicts. Skills can be created, opened, shared between provider locations, or enabled as defaults for every run.
 
-The MCP view runs each installed CLI's native list command and merges the reported servers. AgentDock does not proxy MCP traffic or modify the returned server list.
+### Unified MCP view
 
-### Unified MCP manager
+A single **MCP servers** view is the one place to manage MCP connections for every CLI. It combines three sections:
 
-The MCP manager is a separate view that treats MCP servers as first-class, cross-provider objects. Instead of editing each CLI's config files by hand, you maintain one catalog and apply it to every provider.
+- **Built-in AgentDock servers.** `agentdock-browser` (injected into every run) and `agentdock-delegate` (the Delegation Belt, injected when "Allow delegation" is enabled in Orchestration) are listed with honest lifecycle states — *Active*, *Starting*, or *On-demand* — instead of a misleading "unavailable".
+- **Managed catalog.** Cross-provider server entries with scope (global or workspace), transport (stdio, SSE, or HTTP), command/args/env, URL, and headers. Provider chips show the **actual connection state** per CLI by comparing the catalog against each CLI's native `mcp list` output: green ● connected, amber ◌ in catalog but not yet reported, blue for CLI-only extras. A **Sync to all CLIs** action enables a server for Codex, Claude Code, and OpenCode and writes their configs in one click.
+- **Detected in CLI configs.** Servers the CLIs report that are not in the catalog yet, with an **Import** action to take them over.
 
-- **One catalog, three CLIs.** Each server entry declares which providers (Codex, Claude Code, OpenCode) it applies to, its scope (global or workspace), transport (stdio, SSE, or HTTP), command/args/env, URL, and headers. The `agentdock-browser` server is reserved and cannot be edited here.
-- **Import from existing configs.** Codex `config.toml`, Claude `~/.claude.json` and workspace `.mcp.json`, and OpenCode `opencode.json` are read into the unified format. Servers found in multiple providers are merged by name, preserving each provider tag. Project-scoped files are imported when a workspace is active.
-- **Sync back to CLI configs.** "Apply changes" writes the catalog into each provider's native config files, scoped by the server's `providers` and `scope`. Existing CLI-only entries are preserved, and a timestamped backup of every touched file is written to `userData/mcp-backups` before any change. The read-only MCP view and the running agents are unaffected; the next CLI launch picks up the updated config.
-- **Health checks.** A per-server check verifies that a stdio command resolves on `PATH` (`where`/`which`) or that an HTTP/SSE endpoint returns a status below 500.
-- **Conflict detection.** Servers present in a CLI config but absent from the catalog, or whose command/URL/transport/enabled state diverges, are surfaced as conflicts so you can reconcile them with a sync.
-- **Portable export/import.** The whole catalog (or selected servers) can be exported to a JSON file and imported on another machine, merging by server name.
+The catalog syncs back to each CLI's native config files ("Apply changes"), with timestamped backups under `userData/mcp-backups`, per-server health checks, conflict detection, and portable JSON export/import. The CLI-reported list refreshes automatically when the view opens and after every sync.
 
 ### Permissions, Git, and attachments
 
@@ -158,9 +169,41 @@ Post-run verification runs an explicit test argv (e.g. `npm test`). `protected_p
 
 Write runs can optionally execute in an isolated Git worktree under `userData/workspaces/<task>/<attempt>/tree`. The proven work product is a `git diff` captured in the worktree; the winner is auto-adopted into the live tree via `git apply --check` → apply. Non-Git projects auto-init a baseline commit. This keeps race candidates from clobbering each other, leaves no debris from failed runs, and gives a clean before/after diff. For non-race runs it is opt-in via an "isolated run" toggle; the default remains in-place execution.
 
-### Activity and usage
+### Delegation Belt (scoped sub-run MCP tools)
 
-AgentDock parses provider output into a shared activity model and shows commands, tool calls, reasoning when exposed, and changed-file summaries. Workspace changes are calculated from Git state before and after a run.
+A run can opt into a **delegation** capability through the `agentdock-delegate` MCP server. It exposes a controlled subset of AgentDock orchestration to the running agent, so a Claude/Codex/OpenCode agent can spawn scoped sub-work itself — research, plan, compare approaches, or isolate risky writes — with policy enforced server-side.
+
+**Tools.** Six scoped tools, none of which can apply a patch, approve gates, rotate profiles, or change settings:
+
+| Tool | Intent | Scope |
+|---|---|---|
+| `delegate_ask` | read-only question | `ask` sub-run, no apply |
+| `delegate_plan` | plan + open questions | `plan` sub-run, writes a plan file only |
+| `delegate_run` | write | `agent` sub-run inside an isolated worktree |
+| `delegate_best_of` | best-of-N race | candidates in worktrees; winner is **not** auto-adopted |
+| `delegate_run_status` | poll | status of a spawned sub-run |
+| `delegate_run_result` | fetch | summary + artifacts of a finished sub-run |
+
+**Policy.** Enforced server-side in `delegate-mcp.cjs`: hard cap of 8 sub-runs per parent run, nesting depth capped at 1 (a sub-run cannot delegate further), `--n` inside `delegate_best_of` capped at 3, and sub-run cost must stay within the parent run's remaining budget. Every sub-run is attributed to the parent session and its spend ledger.
+
+**Unified MCP injection.** Both the browser MCP and the delegate MCP are injected per run through a single source of truth in `mcp-injection.cjs`, which merges multiple server descriptors into the provider-specific mechanism:
+
+- **Codex** — one `-c mcp_servers.<name>=…` arg and one bearer-token env var per server.
+- **Claude Code** — a single temporary `--mcp-config` JSON file merging all `mcpServers` entries (Claude honours only one config file).
+- **OpenCode** — all servers merged into `OPENCODE_CONFIG_CONTENT.mcp` as `remote` entries, preserving existing fields and permissions.
+
+The delegate server binds to `127.0.0.1` with a per-run bearer token (never reaches the renderer, transcripts, events, or logs), self-terminates with the parent run, and receives an awareness prompt injected into the agent's context describing the available scoped tools and the nesting cap.
+
+### Activity timeline and chat
+
+AgentDock parses provider output into a shared activity model and renders it as a single **chronological timeline**: reasoning, intermediate agent messages, commands, tool calls, and file edits appear in the order the CLI produced them. While a run is active, the chat shows a working indicator with elapsed time, the live activity feed, the agent's streaming answer, and a spinner on the currently running command.
+
+- **Markdown rendering.** Final agent answers render headings, lists, bold, inline code, code blocks, and links through a dependency-free renderer.
+- **Colored diffs.** File diffs are highlighted (additions, deletions, hunk headers) everywhere they appear — the activity feed, final summaries, the approval inbox, race candidates, and `.diff`/`.patch` run artifacts.
+- **Agent questions.** When a finished run ends with questions, an answer panel appears under the message with one input per question; answers are sent back as a structured follow-up. Plan-contract open questions keep their dedicated form in the Plan panel.
+- **Timestamps.** Messages carry real timestamps, and the run tree shows each run's duration and age.
+
+### Usage
 
 The usage panel displays normalized session token counts. Codex and Claude plan limits are queried through their native CLI interfaces when available; unavailable or unparseable values are reported as such.
 
@@ -254,19 +297,40 @@ electron/
                        CDP attach, snapshot/refs, click/type/select/press/scroll/wait
   browser-mcp.cjs      Loopback HTTP MCP bridge with bearer token and tool schemas
   browser-mcp-config.cjs
-                       Ephemeral provider MCP injection and browser-awareness prompt
+                        Ephemeral browser-MCP injection and browser-awareness prompt
+  mcp-injection.cjs    Single source of truth for per-provider injection of multiple
+                        HTTP/Streamable MCP servers (browser + delegate); merges descriptors
+                        into one Claude --mcp-config file / Codex -c args / OpenCode env
+  delegate-mcp.cjs     Scoped delegation MCP server (agentdock-delegate): six sub-run tools,
+                        policy caps, nesting/budget enforcement, self-terminates with the run
+  delegate-mcp-config.cjs
+                        Per-run scoping for the Delegation Belt: policy from parent request,
+                        combined browser + delegate launch options via mcp-injection
   mcp-manager.cjs      Unified MCP catalog: store, import/sync to CLI configs, health, conflicts, export/import
 src/
-  App.tsx              React interface and session workflow
+  App.tsx              React interface, session workflow, chat timeline, pipeline engine
   components/
     MoreMenu.tsx       "More" dropdown with embedded-browser entry
     BrowserView.tsx    Browser chrome, address bar, bounds placeholder, agent-action bar
-    McpManagerView.tsx Unified MCP manager UI: list, filters, editor, sync, health, conflicts, export/import
-  agent-events.mjs     Provider output normalization and typed event lifecycle
+    McpManagerView.tsx Unified MCP view: built-in servers, managed catalog with per-CLI
+                       connection status, sync-to-all, detected CLI servers, editor, health
+    PipelinePanel.tsx  Agent pipeline: step editor, role templates + library, prompt builder,
+                       verdict parsing, progress strip
+    Markdown.tsx       Dependency-free markdown renderer and colored diff view
+    PlanPanel.tsx      Plan contract: readiness, open-questions form, implement/re-plan
+    OrchestrationControls.tsx
+                       Gates, repair, budget, delegation, race, and council configuration
+    CompareView.tsx    Best-of-N race candidate comparison and adoption
+    ApprovalInbox.tsx  Pending needs-human runs with diff preview and approve/reject
+    RunTree.tsx        Run hierarchy with outcomes, durations, and stop controls
+    ArtifactsPanel.tsx Run artifact browser with manifest verification and export
+    ProfilesView.tsx   Credential profile management
+  agent-events.mjs     Provider output normalization, chronological timeline, typed events
   activity-format.mjs
                        Human-readable activity descriptions
 test/                  Node test suite for adapters, permissions, skills, browser URL/MCP config,
-                      event parsing, MCP manager, plan, council, gates, repair, budget, race, and worktree
+                       event parsing, MCP manager, plan, council, gates, repair, budget, race,
+                       worktree, MCP injection, and delegate MCP
 test/fixtures/browser-site/
                        HTML fixture for integration testing of browser automation
 ```
@@ -275,7 +339,7 @@ The Electron main process owns filesystem access and child processes. The React 
 
 ## Current limitations
 
-- Session storage is local JSON and has no search or cloud synchronization.
+- Session storage is local JSON and has no cloud synchronization.
 - Context transfer across providers uses continuation packets with a byte budget; very long histories are summarized or truncated to one-liners beyond the budget.
 - The embedded browser is single-tab; multi-tab support is planned.
 - Agent browser actions are visible but do not yet require per-action approval prompts (planned for a follow-up release).
