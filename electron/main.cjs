@@ -6,11 +6,22 @@ const crypto = require('node:crypto')
 const { globalSkillPrompt, hashSkillDirectory, isInside, listSkills, shareTargetPaths, skillRoot, skillTemplate } = require('./skills.cjs')
 const { normalizePermissionMode, permissionLaunchOptions } = require('./permissions.cjs')
 const { adapters } = require('./adapters.cjs')
+const { createBrowserManager } = require('./browser-manager.cjs')
+const { createBrowserAutomation } = require('./browser-automation.cjs')
+const { createBrowserMcp, SERVER_NAME: BROWSER_MCP_NAME } = require('./browser-mcp.cjs')
+const { browserMcpLaunchOptions, withBrowserAwarenessPrompt } = require('./browser-mcp-config.cjs')
+const { normalizeBounds } = require('./browser-url.cjs')
 
 const running = new Map()
 const SESSION_STORE_VERSION = 1
 const SETTINGS_STORE_VERSION = 1
 const getCodexHome = () => process.env.CODEX_HOME || path.join(app.getPath('home'), '.codex')
+
+const browserManager = createBrowserManager()
+const browserAutomation = createBrowserAutomation(browserManager)
+const browserMcp = createBrowserMcp(browserManager, browserAutomation)
+let browserMcpReady = false
+let mainWindow = null
 
 function normalizeTokenUsage(value) {
   if (!value || typeof value !== 'object') return undefined
@@ -419,6 +430,10 @@ async function loadMcpServers() {
     const match = line.match(/[●○!]?\s*([^\s].*?)\s+(?:connected|enabled|disabled|failed)$/i)
     if (match) add(match[1].trim(), 'opencode', /connected|enabled/i.test(line), 'OpenCode')
   }
+  // Managed embedded browser MCP — automatically injected into every agent run.
+  add(BROWSER_MCP_NAME, 'codex', browserMcpReady, browserMcpReady ? 'AgentDock embedded browser (auto-injected)' : 'AgentDock embedded browser (starting)')
+  add(BROWSER_MCP_NAME, 'claude', browserMcpReady, browserMcpReady ? 'AgentDock embedded browser (auto-injected)' : 'AgentDock embedded browser (starting)')
+  add(BROWSER_MCP_NAME, 'opencode', browserMcpReady, browserMcpReady ? 'AgentDock embedded browser (auto-injected)' : 'AgentDock embedded browser (starting)')
   return [...servers.values()]
 }
 
@@ -451,6 +466,15 @@ function createWindow() {
     },
   })
 
+  mainWindow = window
+  browserManager.attach(window)
+
+  const syncBrowserBounds = () => {
+    if (!browserManager.isVisible()) return
+    window.webContents.send('browser:request-bounds')
+  }
+  window.on('resize', syncBrowserBounds)
+
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) shell.openExternal(url)
     return { action: 'deny' }
@@ -463,6 +487,41 @@ function createWindow() {
 ipcMain.handle('system:info', loadSystemInfo)
 
 ipcMain.handle('mcp:list', loadMcpServers)
+
+// --- Browser IPC ---
+ipcMain.handle('browser:get-state', () => browserManager.getState())
+ipcMain.handle('browser:open', async (_event, url) => browserManager.open(url))
+ipcMain.handle('browser:show', async () => browserManager.showView())
+ipcMain.handle('browser:hide', async () => browserManager.hideView())
+ipcMain.handle('browser:navigate', async (_event, url) => browserManager.navigate(url))
+ipcMain.handle('browser:back', async () => browserManager.back())
+ipcMain.handle('browser:forward', async () => browserManager.forward())
+ipcMain.handle('browser:reload', async () => browserManager.reload())
+ipcMain.handle('browser:stop', async () => browserManager.stop())
+ipcMain.handle('browser:set-bounds', async (_event, rawBounds) => {
+  if (!mainWindow) return
+  const windowBounds = mainWindow.getBounds()
+  const normalized = normalizeBounds(rawBounds, { width: windowBounds.width, height: windowBounds.height })
+  if (normalized.ok) browserManager.setBounds(normalized.bounds)
+})
+ipcMain.handle('browser:open-external', async () => {
+  const state = browserManager.getState()
+  if (state && /^https?:/.test(state.url)) await shell.openExternal(state.url)
+})
+ipcMain.handle('browser:cancel-agent-action', async () => {
+  browserAutomation.cancel()
+  browserManager.notifyAction({ actor: 'user', status: 'completed', startedAt: Date.now(), summary: 'Agent action cancelled by user' })
+  return true
+})
+
+function forwardBrowserState(state) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('browser:state', state)
+}
+function forwardBrowserAction(action) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('browser:action', action)
+}
+browserManager.onState(forwardBrowserState)
+browserManager.onAction(forwardBrowserAction)
 
 ipcMain.handle('skills:list', (_event, workspace) => {
   const resolvedWorkspace = path.resolve(workspace || process.cwd())
@@ -685,18 +744,23 @@ ipcMain.handle('agent:run', async (event, request) => {
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
   const changesBeforeRun = await readWorkspaceChanges(workspace)
   const availableSkills = listSkills(workspace, app.getPath('home'), getCodexHome())
-  const prompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
+  const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
+  const prompt = withBrowserAwarenessPrompt(basePrompt)
 
   const runId = crypto.randomUUID()
   const permissions = permissionLaunchOptions(request.provider, request.permissionMode, process.env)
-  const child = spawn(adapter.executable, adapter.buildArgs({ ...request, prompt, workspace, permissionArgs: permissions.args }), {
+  const descriptor = browserMcpReady ? browserMcp.descriptor() : null
+  const browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
+  const mergedEnv = { ...permissions.env, ...browserOptions.env, NO_COLOR: '1', FORCE_COLOR: '0' }
+  const mergedArgs = [...permissions.args, ...browserOptions.args]
+  const child = spawn(adapter.executable, adapter.buildArgs({ ...request, prompt, workspace, permissionArgs: mergedArgs }), {
     cwd: workspace,
-    env: { ...permissions.env, NO_COLOR: '1', FORCE_COLOR: '0' },
+    env: mergedEnv,
     windowsHide: true,
     shell: false,
   })
   child.stdin.end()
-  running.set(runId, child)
+  running.set(runId, { child, cleanup: browserOptions.cleanup })
 
   const emit = (type, data = '') => {
     if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId, type, data })
@@ -706,6 +770,7 @@ ipcMain.handle('agent:run', async (event, request) => {
   child.on('error', (error) => emit('error', error.message))
   child.on('close', async (code) => {
     running.delete(runId)
+    try { await browserOptions.cleanup() } catch {}
     const changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
     if (changes.length) emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
     emit('exit', String(code ?? -1))
@@ -713,19 +778,37 @@ ipcMain.handle('agent:run', async (event, request) => {
   return { runId }
 })
 
-ipcMain.handle('agent:stop', (_event, runId) => {
-  const child = running.get(runId)
-  if (!child) return false
-  child.kill()
+ipcMain.handle('agent:stop', async (_event, runId) => {
+  const entry = running.get(runId)
+  if (!entry) return false
+  entry.child.kill()
   running.delete(runId)
+  try { if (entry.cleanup) await entry.cleanup() } catch {}
   return true
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   createWindow()
+  try {
+    await browserMcp.start()
+    browserMcpReady = true
+  } catch (error) {
+    console.error('[agentdock] Failed to start browser MCP:', error && error.message ? error.message : error)
+  }
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
 })
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', async (event) => {
+  if (browserMcpReady || browserManager.isVisible()) {
+    event.preventDefault()
+    try { browserAutomation.detach() } catch {}
+    try { await browserManager.destroy() } catch {}
+    try { await browserMcp.stop() } catch {}
+    browserMcpReady = false
+    app.quit()
+  }
 })

@@ -124,6 +124,46 @@ interface AgentEvent {
   data: string
 }
 
+interface BrowserTabState {
+  id: string
+  url: string
+  title: string
+  loading: boolean
+  canGoBack: boolean
+  canGoForward: boolean
+  visible: boolean
+  revision: number
+  lastError?: string
+}
+
+interface BrowserActionState {
+  actor: 'user' | 'agent'
+  tool?: string
+  status: 'started' | 'completed' | 'failed'
+  startedAt: number
+  summary: string
+}
+
+interface BrowserRect { x: number; y: number; width: number; height: number }
+
+interface BrowserApi {
+  getState(): Promise<BrowserTabState | null>
+  open(url?: string): Promise<BrowserTabState>
+  show(): Promise<void>
+  hide(): Promise<void>
+  navigate(url: string): Promise<BrowserTabState>
+  back(): Promise<void>
+  forward(): Promise<void>
+  reload(): Promise<void>
+  stop(): Promise<void>
+  setBounds(bounds: BrowserRect): Promise<void>
+  openExternal(): Promise<void>
+  cancelAgentAction(): Promise<boolean>
+  onState(listener: (state: BrowserTabState) => void): () => void
+  onAction(listener: (action: BrowserActionState) => void): () => void
+  onRequestBounds(listener: () => void): () => void
+}
+
 interface Window {
   agentDock?: {
     getSystemInfo(): Promise<{
@@ -152,6 +192,7 @@ interface Window {
     configureProvider(provider: ProviderId): Promise<boolean>
     runAgent(request: { provider: ProviderId; model: string; reasoning: string; agent: string; permissionMode: PermissionMode; prompt: string; workspace: string; attachments: string[] }): Promise<{ runId: string }>
     stopAgent(runId: string): Promise<boolean>
+    browser: BrowserApi
     onAgentEvent(listener: (event: AgentEvent) => void): () => void
   }
 }

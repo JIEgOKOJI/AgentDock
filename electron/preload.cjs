@@ -22,6 +22,35 @@ contextBridge.exposeInMainWorld('agentDock', {
   configureProvider: (provider) => ipcRenderer.invoke('provider:configure', provider),
   runAgent: (request) => ipcRenderer.invoke('agent:run', request),
   stopAgent: (runId) => ipcRenderer.invoke('agent:stop', runId),
+  browser: {
+    getState: () => ipcRenderer.invoke('browser:get-state'),
+    open: (url) => ipcRenderer.invoke('browser:open', url),
+    show: () => ipcRenderer.invoke('browser:show'),
+    hide: () => ipcRenderer.invoke('browser:hide'),
+    navigate: (url) => ipcRenderer.invoke('browser:navigate', url),
+    back: () => ipcRenderer.invoke('browser:back'),
+    forward: () => ipcRenderer.invoke('browser:forward'),
+    reload: () => ipcRenderer.invoke('browser:reload'),
+    stop: () => ipcRenderer.invoke('browser:stop'),
+    setBounds: (bounds) => ipcRenderer.invoke('browser:set-bounds', bounds),
+    openExternal: () => ipcRenderer.invoke('browser:open-external'),
+    cancelAgentAction: () => ipcRenderer.invoke('browser:cancel-agent-action'),
+    onState: (listener) => {
+      const wrapped = (_event, state) => listener(state)
+      ipcRenderer.on('browser:state', wrapped)
+      return () => ipcRenderer.removeListener('browser:state', wrapped)
+    },
+    onAction: (listener) => {
+      const wrapped = (_event, action) => listener(action)
+      ipcRenderer.on('browser:action', wrapped)
+      return () => ipcRenderer.removeListener('browser:action', wrapped)
+    },
+    onRequestBounds: (listener) => {
+      const wrapped = () => listener()
+      ipcRenderer.on('browser:request-bounds', wrapped)
+      return () => ipcRenderer.removeListener('browser:request-bounds', wrapped)
+    },
+  },
   onAgentEvent: (listener) => {
     const wrapped = (_event, payload) => listener(payload)
     ipcRenderer.on('agent:event', wrapped)

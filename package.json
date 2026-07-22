@@ -22,22 +22,23 @@
     "dist:mac": "npm run build && node scripts/package.cjs --mac --arm64"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "lucide-react": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "vite": "latest"
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@vitejs/plugin-react": "^6.0.4",
+    "lucide-react": "^1.25.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "vite": "^8.1.5"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
-    "concurrently": "latest",
-    "cross-env": "latest",
-    "electron": "latest",
-    "electron-builder": "latest",
-    "typescript": "latest",
-    "wait-on": "latest"
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^43.2.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2",
+    "wait-on": "^8.0.3"
   },
   "build": {
     "appId": "dev.agentdock.desktop",
@@ -46,6 +47,6 @@
     "directories": { "output": "release", "buildResources": "build" },
     "win": { "target": "nsis", "icon": "build/icon.ico" },
     "mac": { "target": "dmg", "icon": "build/icon.icns" },
-    "linux": { "target": ["AppImage", "deb"], "icon": "build/icon.png", "category": "Development", "syncDesktopName": true }
+    "linux": { "target": ["AppImage", "deb"], "icon": "build/icon.png", "category": "Development" }
   }
 }

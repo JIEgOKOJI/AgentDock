@@ -24,6 +24,7 @@ const adapters = {
       ...permissionArgs,
       ...(model ? ['--model', model] : []),
       ...(reasoning ? ['--effort', reasoning] : []),
+      '--',
       promptWithAttachments(prompt, attachments),
     ],
   },

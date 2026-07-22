@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Blocks, Bot, BrainCircuit, Check, ChevronDown, ChevronRight, CircleStop,
-  Command, Folder, GitBranch, Menu, MessageSquareText, MoreHorizontal, RefreshCw,
+  Command, Folder, GitBranch, Menu, MessageSquareText, RefreshCw,
   PanelLeftClose, Paperclip, PlugZap, Plus, Search, Send, Settings, Sparkles,
   FileDiff, FileText, Hand, ShieldAlert, ShieldCheck, Share2, TerminalSquare, Wrench, X, Zap,
 } from 'lucide-react'
 import { parseAgentTranscript } from './agent-events.mjs'
 import { describeActivity } from './activity-format.mjs'
+import { MoreMenu, MoreMenuTrigger } from './components/MoreMenu'
+import { BrowserView } from './components/BrowserView'
 
 type ProviderId = 'codex' | 'claude' | 'opencode'
 type ViewId = 'chat' | 'providers' | 'mcp' | 'skills' | 'settings'
@@ -182,6 +184,8 @@ export default function App() {
   const [branchMenu, setBranchMenu] = useState(false)
   const [newBranch, setNewBranch] = useState('')
   const [branchError, setBranchError] = useState('')
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false)
+  const [browserVisible, setBrowserVisible] = useState(false)
   const [mcpServers, setMcpServers] = useState<McpServerInfo[]>([])
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
@@ -253,6 +257,13 @@ export default function App() {
       setSessionsReady(true)
     }).catch(() => setSessionsReady(true))
     window.agentDock?.getMcpServers().then(setMcpServers).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    const api = window.agentDock?.browser
+    if (!api) return
+    api.getState().then((state) => setBrowserVisible(Boolean(state?.visible))).catch(() => {})
+    return api.onState((state) => setBrowserVisible(state.visible))
   }, [])
 
   useEffect(() => {
@@ -569,14 +580,16 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main-panel">
+      <div className={`content-shell ${browserVisible ? 'browser-open' : ''}`}>
+        <main className="main-panel">
         <div className="panel-toolbar">
           <button className="icon-button" onClick={() => setSidebarOpen(!sidebarOpen)}>{sidebarOpen ? <PanelLeftClose size={18} /> : <Menu size={18} />}</button>
           <div className="toolbar-title"><span>{title}</span>{view === 'chat' && <><ChevronRight size={14} /><strong>{sessionTitle(messages)}</strong></>}</div>
           <div className="toolbar-spacer" />
           {view === 'chat' && <button className="workspace-picker" onClick={chooseWorkspace} disabled={Boolean(runId)} title="Start a session in another project"><Folder size={14} /><span>{workspaceName(workspace)}</span><ChevronDown size={13} /></button>}
           <button className="icon-button"><Search size={17} /></button>
-          <button className="icon-button"><MoreHorizontal size={18} /></button>
+          <MoreMenuTrigger open={moreMenuOpen} onClick={() => setMoreMenuOpen(!moreMenuOpen)} />
+          <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} />
         </div>
 
         {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits }} sessionTitle={sessionTitle(messages)} />}
@@ -585,7 +598,9 @@ export default function App() {
         {view === 'skills' && <SkillsView workspace={workspace} />}
         {view === 'settings' && <SettingsView workspace={workspace} />}
         <div ref={messagesEnd} />
-      </main>
+        </main>
+        {browserVisible && <BrowserView onClose={() => setBrowserVisible(false)} />}
+      </div>
     </div>
   </div>
 }

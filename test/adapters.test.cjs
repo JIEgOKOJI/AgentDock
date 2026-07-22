@@ -28,6 +28,7 @@ test('terminates Codex variadic image arguments before the prompt', () => {
 test('gives Claude an explicit attachment-aware prompt', () => {
   const args = adapters.claude.buildArgs(request)
   assert.equal(args.includes('--append-system-prompt'), false)
+  assert.equal(args.at(-2), '--')
   assert.match(args.at(-1), /C:\\Temp\\screen shot\.png/)
 })
 

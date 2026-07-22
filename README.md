@@ -61,6 +61,21 @@ AgentDock parses provider output into a shared activity model and shows commands
 
 The usage panel displays normalized session token counts. Codex and Claude plan limits are queried through their native CLI interfaces when available; unavailable or unparseable values are reported as such.
 
+### Embedded browser and Browser MCP
+
+AgentDock includes an embedded Chromium browser, opened as a split panel to the right of the chat from the toolbar's "more" menu. The browser and the running CLI agents share the same `WebContentsView` instance, so when a user asks an agent to "look at the open browser," the agent inspects the exact page the user sees.
+
+- **One shared browser.** A single `WebContentsView` with a persistent partition (`persist:agentdock-browser`) stores logins and cookies across restarts, isolated from the AgentDock renderer session.
+- **Automatic MCP injection.** Every `agent:run` automatically receives an `agentdock-browser` MCP server via ephemeral provider-specific configuration. No global CLI config is modified:
+  - **Codex** receives the server through `-c mcp_servers.agentdock-browser=...` with the bearer token passed via an environment variable.
+  - **Claude Code** receives a temporary `--mcp-config` JSON file written to the OS temp directory and removed after the run.
+  - **OpenCode** receives the server merged into the inline `OPENCODE_CONFIG_CONTENT`, preserving existing fields and permissions.
+- **Built-in browser capability.** Every Codex, Claude Code, and OpenCode run is told that `agentdock-browser` can inspect the live page, verify completed web pages, and review example or reference sites.
+- **CDP automation.** The `agentdock-browser` MCP exposes tools for `browser_get_state`, `browser_open`, `browser_navigate`, `browser_snapshot` (accessibility tree with revision-aware element refs), `browser_screenshot`, `browser_click`, `browser_type`, `browser_select`, `browser_press_key`, `browser_scroll`, `browser_wait`, and history navigation. Element refs are invalidated on navigation to prevent stale interactions.
+- **Security model.** The MCP bridge binds only to `127.0.0.1` with a cryptographic bearer token generated per app session. The token never reaches the renderer, transcripts, events, or logs. Cookies, localStorage, sessionStorage, password fields, and request headers are not exposed to agents. Guest web contents run with `nodeIntegration: false`, `contextIsolation: true`, and `sandbox: true`; camera, microphone, geolocation, notifications, clipboard, and downloads are denied by default. The UI shows an agent-action indicator with a cancel button when an agent is controlling the browser.
+
+The embedded browser is currently single-tab. Mutating agent actions are visible to the user; future releases will add explicit approval prompts for sensitive operations.
+
 ## Run locally
 
 Requirements:
@@ -102,17 +117,29 @@ Configured package targets are NSIS for Windows, DMG for macOS, and AppImage plu
 
 ```text
 electron/
-  main.cjs         Electron main process, IPC, persistence, CLI execution, Git and MCP
-  preload.cjs      Narrow IPC bridge exposed to the renderer
-  adapters.cjs     Provider-specific CLI argument builders
-  permissions.cjs  Permission-mode mapping
-  skills.cjs       Skill discovery, grouping, sharing, and prompt injection
+  main.cjs             Electron main process, IPC, persistence, CLI execution, Git and MCP
+  preload.cjs          Narrow IPC bridge exposed to the renderer
+  adapters.cjs         Provider-specific CLI argument builders
+  permissions.cjs      Permission-mode mapping
+  skills.cjs           Skill discovery, grouping, sharing, and prompt injection
+  browser-url.cjs      URL normalization and bounds validation for the embedded browser
+  browser-manager.cjs  WebContentsView lifecycle, state, navigation, and events
+  browser-automation.cjs
+                        CDP attach, snapshot/refs, click/type/select/press/scroll/wait
+  browser-mcp.cjs      Loopback HTTP MCP bridge with bearer token and tool schemas
+  browser-mcp-config.cjs
+                        Ephemeral provider MCP injection and browser-awareness prompt
 src/
-  App.tsx          React interface and session workflow
-  agent-events.mjs Provider output normalization
+  App.tsx              React interface and session workflow
+  components/
+    MoreMenu.tsx       "More" dropdown with embedded-browser entry
+    BrowserView.tsx    Browser chrome, address bar, bounds placeholder, agent-action bar
+  agent-events.mjs     Provider output normalization
   activity-format.mjs
-                    Human-readable activity descriptions
-test/               Node test suite for adapters, permissions, Skills, and event parsing
+                       Human-readable activity descriptions
+test/                  Node test suite for adapters, permissions, skills, browser URL/MCP config, and event parsing
+test/fixtures/browser-site/
+                       HTML fixture for integration testing of browser automation
 ```
 
 The Electron main process owns filesystem access and child processes. The React renderer uses the API exposed by `preload.cjs`; Electron is configured with `contextIsolation: true`, `nodeIntegration: false`, and renderer sandboxing enabled.
@@ -121,7 +148,9 @@ The Electron main process owns filesystem access and child processes. The React 
 
 - Session storage is local JSON and has no search or cloud synchronization.
 - Context transfer uses recent transcript messages rather than native cross-provider session resumption.
-- MCP support is a consolidated read-only view.
+- The embedded browser is single-tab; multi-tab support is planned.
+- Agent browser actions are visible but do not yet require per-action approval prompts (planned for a follow-up release).
+- `evaluateJavaScript` is intentionally not exposed to agents; cookies, localStorage, sessionStorage, password fields, and request headers are never shared with MCP.
 - Model discovery, usage parsing, and permission behavior depend on the installed CLI versions.
 
 ## License
