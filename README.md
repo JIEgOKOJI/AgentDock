@@ -39,6 +39,19 @@ Sessions are saved as versioned JSON in Electron's `userData` directory. A sessi
 
 When sending a prompt, AgentDock includes up to eight recent transcript messages as provider-neutral continuation context. This makes provider switching practical without depending on one CLI's native session format.
 
+### Restart, resume, and retry
+
+Three actions in the toolbar's "More" menu recover from a stopped or failed run without losing the current tab:
+
+- **Restart agent** relaunches the CLI process in the current tab, preserving the working directory, selected provider, model, reasoning level, agent, permission mode, and attachments. The last user prompt is re-sent as a fresh attempt.
+- **Resume session** continues a saved CLI session through the provider's native resume mechanism, using the stored CLI session id:
+  - **Codex** — `codex exec resume --json --skip-git-repo-check <session-id> <prompt>`
+  - **Claude Code** — `claude --print --output-format stream-json --verbose --resume <session-id> <prompt>`
+  - **OpenCode** — `opencode run --format json --dir <workspace> --session <session-id> <prompt>`
+- **Retry last action** re-sends the last user prompt as a new run. It is enabled only when the previous run exited with a non-zero code.
+
+The CLI session id, last user prompt, last exit code, and run-failed flag are persisted alongside the session, so these actions remain available after restarting the app.
+
 ### Skills and MCP servers
 
 AgentDock discovers Skills from supported global and project locations, groups matching copies by name and content hash, and identifies conflicts. Skills can be created, opened, shared between provider locations, or enabled as defaults for every run.
@@ -162,7 +175,7 @@ The Electron main process owns filesystem access and child processes. The React 
 ## Current limitations
 
 - Session storage is local JSON and has no search or cloud synchronization.
-- Context transfer uses recent transcript messages rather than native cross-provider session resumption.
+- Context transfer across providers uses recent transcript messages; native CLI session resume is supported within the same provider only.
 - The embedded browser is single-tab; multi-tab support is planned.
 - Agent browser actions are visible but do not yet require per-action approval prompts (planned for a follow-up release).
 - `evaluateJavaScript` is intentionally not exposed to agents; cookies, localStorage, sessionStorage, password fields, and request headers are never shared with MCP.
