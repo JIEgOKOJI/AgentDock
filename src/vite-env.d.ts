@@ -164,6 +164,11 @@ interface BrowserApi {
   onRequestBounds(listener: () => void): () => void
 }
 
+interface AppSettings {
+  defaultGlobalSkills: string[]
+  contextHandoff: boolean
+}
+
 interface Window {
   agentDock?: {
     getSystemInfo(): Promise<{
@@ -176,6 +181,8 @@ interface Window {
     listSkills(workspace: string): Promise<SkillInfo[]>
     getDefaultGlobalSkills(): Promise<string[]>
     setDefaultGlobalSkill(request: { workspace: string; id: string; enabled: boolean }): Promise<string[]>
+    getSettings(): Promise<AppSettings>
+    patchSettings(request: Partial<AppSettings>): Promise<AppSettings>
     createSkill(request: { workspace: string; scope: SkillInfo['scope'] }): Promise<string | null>
     openSkill(request: { workspace: string; path: string }): Promise<boolean>
     shareSkill(request: { workspace: string; id: string; path: string }): Promise<{ canceled: boolean; updated: number; backups: string[] }>

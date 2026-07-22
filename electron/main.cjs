@@ -14,8 +14,10 @@ const { normalizeBounds } = require('./browser-url.cjs')
 
 const running = new Map()
 const SESSION_STORE_VERSION = 1
-const SETTINGS_STORE_VERSION = 1
+const SETTINGS_STORE_VERSION = 2
 const getCodexHome = () => process.env.CODEX_HOME || path.join(app.getPath('home'), '.codex')
+
+const DEFAULT_SETTINGS = { defaultGlobalSkills: [], contextHandoff: true }
 
 const browserManager = createBrowserManager()
 const browserAutomation = createBrowserAutomation(browserManager)
@@ -49,10 +51,13 @@ function getSettingsStorePath() {
 function readSettings() {
   try {
     const store = JSON.parse(fs.readFileSync(getSettingsStorePath(), 'utf8'))
-    if (store?.version !== SETTINGS_STORE_VERSION) return { defaultGlobalSkills: [] }
-    return { defaultGlobalSkills: Array.isArray(store.defaultGlobalSkills) ? [...new Set(store.defaultGlobalSkills.filter((id) => typeof id === 'string' && id.startsWith('global:')))] : [] }
+    if (store?.version !== SETTINGS_STORE_VERSION) return { ...DEFAULT_SETTINGS }
+    return {
+      defaultGlobalSkills: Array.isArray(store.defaultGlobalSkills) ? [...new Set(store.defaultGlobalSkills.filter((id) => typeof id === 'string' && id.startsWith('global:')))] : [],
+      contextHandoff: typeof store.contextHandoff === 'boolean' ? store.contextHandoff : true,
+    }
   } catch {
-    return { defaultGlobalSkills: [] }
+    return { ...DEFAULT_SETTINGS }
   }
 }
 
@@ -543,6 +548,15 @@ ipcMain.handle('skills:set-default', (_event, request = {}) => {
   settings.defaultGlobalSkills = [...defaults].sort()
   writeSettings(settings)
   return settings.defaultGlobalSkills
+})
+
+ipcMain.handle('settings:get', () => readSettings())
+
+ipcMain.handle('settings:patch', (_event, request = {}) => {
+  const settings = readSettings()
+  if (typeof request.contextHandoff === 'boolean') settings.contextHandoff = request.contextHandoff
+  writeSettings(settings)
+  return settings
 })
 
 ipcMain.handle('skills:create', async (_event, request = {}) => {

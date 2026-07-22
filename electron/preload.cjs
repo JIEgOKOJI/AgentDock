@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('agentDock', {
   listSkills: (workspace) => ipcRenderer.invoke('skills:list', workspace),
   getDefaultGlobalSkills: () => ipcRenderer.invoke('skills:defaults'),
   setDefaultGlobalSkill: (request) => ipcRenderer.invoke('skills:set-default', request),
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  patchSettings: (request) => ipcRenderer.invoke('settings:patch', request),
   createSkill: (request) => ipcRenderer.invoke('skills:create', request),
   openSkill: (request) => ipcRenderer.invoke('skills:open', request),
   shareSkill: (request) => ipcRenderer.invoke('skills:share', request),

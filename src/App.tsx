@@ -161,6 +161,58 @@ function sanitizeDiagnostics(raw: string) {
   }).join('\n')
 }
 
+function buildHandoffContext(messages: Message[]): string {
+  const userMessages = messages.filter((message) => message.role === 'user' && message.id !== 'hello' && !message.pending)
+  const assistantMessages = messages.filter((message) => message.role === 'assistant' && message.id !== 'hello' && !message.pending)
+  if (!userMessages.length && !assistantMessages.length) return ''
+
+  const blocks: string[] = []
+
+  const goal = userMessages[0]?.content.replace(/\s+/g, ' ').trim()
+  if (goal) blocks.push(`## Session goal\n${goal.slice(0, 600)}`)
+
+  const recentUserRequests = userMessages.slice(1).map((message) => message.content.replace(/\s+/g, ' ').trim().slice(0, 200)).filter(Boolean)
+  if (recentUserRequests.length) blocks.push(`## Recent requests\n${recentUserRequests.map((item) => `- ${item}`).join('\n')}`)
+
+  const summaries: string[] = []
+  const allFiles = new Map<string, { additions: number; deletions: number; provider: string }>()
+  const commands: string[] = []
+  for (const message of assistantMessages) {
+    const providerName = message.provider ? providerMeta[message.provider].name : 'Agent'
+    if (message.content && !/^The agent finished without a text response\.?$/.test(message.content.trim())) {
+      summaries.push(`[${providerName}] ${message.content.replace(/\s+/g, ' ').trim().slice(0, 400)}`)
+    }
+    if (message.activities) {
+      for (const activity of message.activities) {
+        if (activity.type === 'command' && activity.title) commands.push(activity.title.slice(0, 120))
+      }
+    }
+    if (message.files) {
+      for (const file of message.files) {
+        const existing = allFiles.get(file.path)
+        if (existing) {
+          existing.additions += file.additions
+          existing.deletions += file.deletions
+        } else {
+          allFiles.set(file.path, { additions: file.additions, deletions: file.deletions, provider: providerName })
+        }
+      }
+    }
+  }
+
+  if (summaries.length) blocks.push(`## Findings & summaries\n${summaries.join('\n')}`)
+  if (allFiles.size) {
+    const fileList = [...allFiles.entries()].map(([path, change]) => `- ${path} (+${change.additions}/-${change.deletions})`).join('\n')
+    blocks.push(`## Files changed\n${fileList}`)
+  }
+  if (commands.length) {
+    const uniqueCommands = [...new Set(commands)].slice(-15)
+    blocks.push(`## Commands run\n${uniqueCommands.map((item) => `- ${item}`).join('\n')}`)
+  }
+
+  return blocks.join('\n\n')
+}
+
 export default function App() {
   const [view, setView] = useState<ViewId>('chat')
   const [sidebarOpen, setSidebarOpen] = useState(true)
@@ -193,6 +245,7 @@ export default function App() {
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>([])
   const [usage, setUsage] = useState<TokenUsage>(emptyTokenUsage)
   const [limits, setLimits] = useState<ProviderLimits | null | undefined>(undefined)
+  const [contextHandoff, setContextHandoff] = useState(true)
   const messagesEnd = useRef<HTMLDivElement>(null)
   const activeRunId = useRef<string | null>(null)
   const limitsRequestId = useRef(0)
@@ -257,6 +310,7 @@ export default function App() {
       setSessionsReady(true)
     }).catch(() => setSessionsReady(true))
     window.agentDock?.getMcpServers().then(setMcpServers).catch(() => {})
+    window.agentDock?.getSettings().then((settings) => setContextHandoff(settings.contextHandoff)).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -474,13 +528,20 @@ export default function App() {
     setPrompt('')
     setRawOutput('')
     const pendingId = crypto.randomUUID()
-    const portableContext = messages
-      .filter((message) => message.id !== 'hello' && !message.pending)
-      .slice(-8)
-      .map((message) => `${message.role === 'user' ? 'User' : providerMeta[message.provider ?? provider].name}: ${message.content}`)
-      .join('\n\n')
+    const conversationMessages = messages.filter((message) => message.id !== 'hello' && !message.pending)
+    let portableContext: string
+    if (contextHandoff) {
+      portableContext = buildHandoffContext(conversationMessages)
+    } else {
+      portableContext = conversationMessages
+        .slice(-8)
+        .map((message) => `${message.role === 'user' ? 'User' : providerMeta[message.provider ?? provider].name}: ${message.content}`)
+        .join('\n\n')
+    }
     const contextBlocks: string[] = []
-    if (portableContext) contextBlocks.push(`Continue from this provider-neutral conversation context:\n\n${portableContext}`)
+    if (portableContext) contextBlocks.push(contextHandoff
+      ? `<agentdock_session_summary>\nThis is a compact summary of the session so far, produced so the new model/provider can continue effectively:\n\n${portableContext}\n</agentdock_session_summary>`
+      : `Continue from this provider-neutral conversation context:\n\n${portableContext}`)
     if (gitInfo?.currentBranch) contextBlocks.push(`Active git branch: ${gitInfo.currentBranch}`)
     if (attachments.length) contextBlocks.push(`Attached files:\n${attachments.map((file) => `- ${file}`).join('\n')}`)
     const contextPrefix = contextBlocks.length
@@ -596,7 +657,7 @@ export default function App() {
         {view === 'providers' && <ProvidersView installed={installed} runtime={runtime} />}
         {view === 'mcp' && <McpView servers={mcpServers} />}
         {view === 'skills' && <SkillsView workspace={workspace} />}
-        {view === 'settings' && <SettingsView workspace={workspace} />}
+        {view === 'settings' && <SettingsView workspace={workspace} contextHandoff={contextHandoff} onContextHandoffChange={async (enabled) => { setContextHandoff(enabled); try { await window.agentDock?.patchSettings({ contextHandoff: enabled }) } catch {} }} />}
         <div ref={messagesEnd} />
         </main>
         {browserVisible && <BrowserView onClose={() => setBrowserVisible(false)} />}
@@ -948,9 +1009,9 @@ function SkillsView({ workspace }: { workspace: string }) {
   </Page>
 }
 
-function SettingsView({ workspace }: { workspace: string }) {
+function SettingsView({ workspace, contextHandoff, onContextHandoffChange }: { workspace: string; contextHandoff: boolean; onContextHandoffChange: (enabled: boolean) => void }) {
   return <Page title="Settings" subtitle="Tune AgentDock for your machine and workflow.">
-    <div className="settings-card"><div className="setting-row"><span><strong>Default workspace</strong><small>New sessions start in this directory</small></span><code>{workspace}</code></div><div className="setting-row"><span><strong>Context handoff</strong><small>Include a compact transcript when switching providers</small></span><label className="switch"><input type="checkbox" defaultChecked /><i /></label></div><div className="setting-row"><span><strong>Run confirmation</strong><small>Ask before an agent executes commands</small></span><label className="switch"><input type="checkbox" defaultChecked /><i /></label></div></div>
+    <div className="settings-card"><div className="setting-row"><span><strong>Default workspace</strong><small>New sessions start in this directory</small></span><code>{workspace}</code></div><div className="setting-row"><span><strong>Context handoff</strong><small>Generate a compact session summary (goal, plan, findings, changes) when switching providers or models, instead of forwarding the last 8 messages</small></span><label className="switch"><input type="checkbox" checked={contextHandoff} onChange={(event) => onContextHandoffChange(event.target.checked)} /><i /></label></div><div className="setting-row"><span><strong>Run confirmation</strong><small>Ask before an agent executes commands</small></span><label className="switch"><input type="checkbox" defaultChecked /><i /></label></div></div>
   </Page>
 }
 
