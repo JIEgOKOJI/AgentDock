@@ -59,3 +59,30 @@ test('merges streaming updates for the same action', async () => {
   assert.equal(result.activities[0].status, 'completed')
   assert.equal(result.activities[0].output, '15 tests passed')
 })
+
+test('captures the Codex thread id from a thread.started event', async () => {
+  const parse = await loadParser()
+  const raw = [
+    { type: 'thread.started', thread_id: '019f88b6-3d49-7cb2-8e7c-6399724a7e51' },
+    { type: 'item.completed', item: { type: 'agent_message', text: 'Hi!' } },
+  ].map(JSON.stringify).join('\n')
+  const result = parse('codex', raw)
+  assert.equal(result.cliSessionId, '019f88b6-3d49-7cb2-8e7c-6399724a7e51')
+})
+
+test('captures the Claude session id from the init event', async () => {
+  const parse = await loadParser()
+  const raw = [
+    { type: 'system', subtype: 'init', session_id: 'e6fe5a8b-917a-4afd-a876-781a71e64db6', cwd: '/tmp' },
+    { type: 'result', result: 'Done.' },
+  ].map(JSON.stringify).join('\n')
+  const result = parse('claude', raw)
+  assert.equal(result.cliSessionId, 'e6fe5a8b-917a-4afd-a876-781a71e64db6')
+})
+
+test('captures the OpenCode session id from any event carrying sessionID', async () => {
+  const parse = await loadParser()
+  const raw = JSON.stringify({ type: 'step_start', sessionID: 'ses_077495d21ffeMcDtjcHVEMa0e2', part: { type: 'step-start' } })
+  const result = parse('opencode', raw)
+  assert.equal(result.cliSessionId, 'ses_077495d21ffeMcDtjcHVEMa0e2')
+})

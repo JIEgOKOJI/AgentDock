@@ -105,6 +105,10 @@ function normalizeSession(value) {
     ...(attachments.length ? { attachments } : {}),
     ...(git ? { git } : {}),
     ...(usage ? { usage } : {}),
+    ...(typeof value.cliSessionId === 'string' && value.cliSessionId ? { cliSessionId: value.cliSessionId } : {}),
+    ...(typeof value.lastPrompt === 'string' && value.lastPrompt ? { lastPrompt: value.lastPrompt } : {}),
+    ...(Number.isFinite(value.lastExitCode) ? { lastExitCode: value.lastExitCode } : {}),
+    ...(typeof value.lastRunFailed === 'boolean' ? { lastRunFailed: value.lastRunFailed } : {}),
     createdAt: Number.isFinite(value.createdAt) ? value.createdAt : Date.now(),
     updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
   }
@@ -756,23 +760,49 @@ ipcMain.handle('agent:run', async (event, request) => {
   if (!adapter) throw new Error(`Unknown provider: ${request.provider}`)
   const workspace = path.resolve(request.workspace || process.cwd())
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
+  const mode = request.mode === 'resume' || request.mode === 'restart' || request.mode === 'retry' ? request.mode : 'run'
   const changesBeforeRun = await readWorkspaceChanges(workspace)
   const availableSkills = listSkills(workspace, app.getPath('home'), getCodexHome())
-  const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
-  const prompt = withBrowserAwarenessPrompt(basePrompt)
 
-  const runId = crypto.randomUUID()
   const permissions = permissionLaunchOptions(request.provider, request.permissionMode, process.env)
   const descriptor = browserMcpReady ? browserMcp.descriptor() : null
-  const browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
-  const mergedEnv = { ...permissions.env, ...browserOptions.env, NO_COLOR: '1', FORCE_COLOR: '0' }
-  const mergedArgs = [...permissions.args, ...browserOptions.args]
-  const child = spawn(adapter.executable, adapter.buildArgs({ ...request, prompt, workspace, permissionArgs: mergedArgs }), {
-    cwd: workspace,
-    env: mergedEnv,
-    windowsHide: true,
-    shell: false,
-  })
+  const runId = crypto.randomUUID()
+  let browserOptions
+  const baseRequest = { ...request, workspace, permissionArgs: permissions.args }
+  let child
+
+  if (mode === 'resume') {
+    browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
+    const mergedEnv = { ...permissions.env, ...browserOptions.env, NO_COLOR: '1', FORCE_COLOR: '0' }
+    const resumePermissionArgs = request.provider === 'codex' ? browserOptions.args : [...permissions.args, ...browserOptions.args]
+    const resumeLastPrompt = withBrowserAwarenessPrompt(request.lastPrompt || request.prompt || 'Continue from where we left off.')
+    const resumeRequest = {
+      ...baseRequest,
+      cliSessionId: request.cliSessionId,
+      lastPrompt: resumeLastPrompt,
+      attachments: request.attachments || [],
+      permissionArgs: resumePermissionArgs,
+      permissionMode: request.permissionMode,
+    }
+    child = spawn(adapter.executable, adapter.buildResumeArgs(resumeRequest), {
+      cwd: workspace,
+      env: mergedEnv,
+      windowsHide: true,
+      shell: false,
+    })
+  } else {
+    const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
+    const prompt = withBrowserAwarenessPrompt(basePrompt)
+    browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
+    const mergedEnv = { ...permissions.env, ...browserOptions.env, NO_COLOR: '1', FORCE_COLOR: '0' }
+    const mergedArgs = [...permissions.args, ...browserOptions.args]
+    child = spawn(adapter.executable, adapter.buildArgs({ ...baseRequest, prompt, permissionArgs: mergedArgs }), {
+      cwd: workspace,
+      env: mergedEnv,
+      windowsHide: true,
+      shell: false,
+    })
+  }
   child.stdin.end()
   running.set(runId, { child, cleanup: browserOptions.cleanup })
 
@@ -792,10 +822,25 @@ ipcMain.handle('agent:run', async (event, request) => {
   return { runId }
 })
 
+const killProcessTree = (child) => {
+  if (!child || child.exitCode !== null) return
+  if (process.platform === 'win32') {
+    try {
+      execFile('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true })
+    } catch {}
+  } else {
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+    } catch {
+      try { child.kill('SIGKILL') } catch {}
+    }
+  }
+}
+
 ipcMain.handle('agent:stop', async (_event, runId) => {
   const entry = running.get(runId)
   if (!entry) return false
-  entry.child.kill()
+  killProcessTree(entry.child)
   running.delete(runId)
   try { if (entry.cleanup) await entry.cleanup() } catch {}
   return true

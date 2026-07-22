@@ -15,6 +15,7 @@ export function parseAgentTranscript(provider, raw) {
   let position = 0
   let lastActionPosition = -1
   let explicitSummary = ''
+  let cliSessionId = ''
 
   const answer = (value, explicit = false) => {
     const text = asText(value)
@@ -67,6 +68,16 @@ export function parseAgentTranscript(provider, raw) {
       continue
     }
 
+    if (!cliSessionId) {
+      if (provider === 'codex' && event.type === 'thread.started' && typeof event.thread_id === 'string') {
+        cliSessionId = event.thread_id
+      } else if (provider === 'claude' && typeof event.session_id === 'string' && /^[0-9a-f-]{36}$/i.test(event.session_id)) {
+        cliSessionId = event.session_id
+      } else if (provider === 'opencode' && typeof event.sessionID === 'string' && event.sessionID.startsWith('ses_')) {
+        cliSessionId = event.sessionID
+      }
+    }
+
     if (provider === 'codex') {
       const item = event.item || {}
       if (item.type === 'agent_message') answer(item.text)
@@ -111,5 +122,5 @@ export function parseAgentTranscript(provider, raw) {
 
   const finalAnswers = answers.filter((item) => item.position > lastActionPosition)
   const content = explicitSummary || (finalAnswers.length ? finalAnswers : answers.slice(-1)).map((item) => item.text).join('\n\n')
-  return { content, activities, finalFiles }
+  return { content, activities, finalFiles, cliSessionId }
 }

@@ -114,6 +114,10 @@ interface ChatSession {
   attachments?: string[]
   git?: GitInfo
   usage?: TokenUsage
+  cliSessionId?: string
+  lastPrompt?: string
+  lastExitCode?: number | null
+  lastRunFailed?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -197,7 +201,19 @@ interface Window {
     checkoutBranch(workspace: string, branch: string): Promise<boolean>
     createBranch(workspace: string, branch: string): Promise<boolean>
     configureProvider(provider: ProviderId): Promise<boolean>
-    runAgent(request: { provider: ProviderId; model: string; reasoning: string; agent: string; permissionMode: PermissionMode; prompt: string; workspace: string; attachments: string[] }): Promise<{ runId: string }>
+    runAgent(request: {
+      provider: ProviderId
+      model: string
+      reasoning: string
+      agent: string
+      permissionMode: PermissionMode
+      prompt: string
+      workspace: string
+      attachments: string[]
+      mode?: 'run' | 'restart' | 'resume' | 'retry'
+      cliSessionId?: string
+      lastPrompt?: string
+    }): Promise<{ runId: string }>
     stopAgent(runId: string): Promise<boolean>
     browser: BrowserApi
     onAgentEvent(listener: (event: AgentEvent) => void): () => void

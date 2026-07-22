@@ -246,8 +246,13 @@ export default function App() {
   const [usage, setUsage] = useState<TokenUsage>(emptyTokenUsage)
   const [limits, setLimits] = useState<ProviderLimits | null | undefined>(undefined)
   const [contextHandoff, setContextHandoff] = useState(true)
+  const [cliSessionId, setCliSessionId] = useState<string | null>(null)
+  const [lastPrompt, setLastPrompt] = useState<string>('')
+  const [lastExitCode, setLastExitCode] = useState<number | null>(null)
+  const [lastRunFailed, setLastRunFailed] = useState(false)
   const messagesEnd = useRef<HTMLDivElement>(null)
   const activeRunId = useRef<string | null>(null)
+  const lastExitCodeRef = useRef<number | null>(null)
   const limitsRequestId = useRef(0)
   const suppressSessionSave = useRef(true)
 
@@ -276,6 +281,10 @@ export default function App() {
     setBranchError('')
     setUsage(session.usage ?? emptyTokenUsage())
     setLimits(undefined)
+    setCliSessionId(session.cliSessionId ?? null)
+    setLastPrompt(session.lastPrompt ?? '')
+    setLastExitCode(session.lastExitCode ?? null)
+    setLastRunFailed(session.lastRunFailed ?? false)
     setView('chat')
   }
 
@@ -369,6 +378,8 @@ export default function App() {
       if (event.type === 'exit') {
         activeRunId.current = null
         setRunId(null)
+        const code = Number(event.data)
+        lastExitCodeRef.current = Number.isFinite(code) ? code : -1
       }
     })
     return typeof unsubscribe === 'function' ? unsubscribe : undefined
@@ -381,8 +392,13 @@ export default function App() {
       const selectedModel = runtime[provider].models.find((item) => item.id === model)
       const turnUsage = extractTokenUsage(provider, rawOutput, selectedModel?.contextWindow)
       if (turnUsage) setUsage((total) => addTokenUsage(total, turnUsage))
+      if (transcript.cliSessionId) setCliSessionId(transcript.cliSessionId)
+      const exitCode = lastExitCodeRef.current
+      setLastExitCode(exitCode)
+      setLastRunFailed(exitCode !== null && exitCode !== 0)
       setMessages((items) => items.map((message) => message.pending ? { ...message, pending: false, content, activities: transcript.activities, files: transcript.finalFiles } : message))
       setRawOutput('')
+      void refreshGitInfo()
     }
   }, [runId, rawOutput, provider, model, runtime])
 
@@ -412,13 +428,17 @@ export default function App() {
         attachments,
         git: gitInfo ?? undefined,
         usage,
+        cliSessionId: cliSessionId ?? undefined,
+        lastPrompt: lastPrompt || undefined,
+        lastExitCode,
+        lastRunFailed: lastRunFailed || undefined,
         updatedAt: Date.now(),
       }
       setSessions((items) => [snapshot, ...items.filter((item) => item.id !== snapshot.id)])
       window.agentDock?.updateSession(snapshot).catch(() => {})
     }, 350)
     return () => window.clearTimeout(timer)
-  }, [agent, activeSessionId, attachments, gitInfo, messages, model, permissionMode, provider, reasoning, sessionsReady, usage, workspace])
+  }, [agent, activeSessionId, attachments, gitInfo, messages, model, permissionMode, provider, reasoning, sessionsReady, usage, workspace, cliSessionId, lastPrompt, lastExitCode, lastRunFailed])
 
   useEffect(() => {
     if (view === 'chat') void refreshGitInfo()
@@ -554,6 +574,59 @@ export default function App() {
       setAttachments([])
       activeRunId.current = result.runId
       setRunId(result.runId)
+      setLastPrompt(value)
+      lastExitCodeRef.current = null
+    } catch (error) {
+      setMessages((items) => items.map((message) => message.id === pendingId ? { ...message, pending: false, content: error instanceof Error ? error.message : String(error) } : message))
+    }
+  }
+
+  const restartAgent = async () => {
+    if (runId || !window.agentDock) return
+    setPrompt('')
+    setRawOutput('')
+    const pendingId = crypto.randomUUID()
+    const restartPrompt = lastPrompt || 'Continue working on the current task.'
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Restarting agent: ${restartPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+    try {
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: restartPrompt, workspace, attachments, mode: 'restart' })
+      activeRunId.current = result.runId
+      setRunId(result.runId)
+      lastExitCodeRef.current = null
+    } catch (error) {
+      setMessages((items) => items.map((message) => message.id === pendingId ? { ...message, pending: false, content: error instanceof Error ? error.message : String(error) } : message))
+    }
+  }
+
+  const resumeSession = async () => {
+    if (runId || !window.agentDock || !cliSessionId) return
+    setPrompt('')
+    setRawOutput('')
+    const pendingId = crypto.randomUUID()
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: 'Resume saved CLI session' }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+    try {
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: '', workspace, attachments, mode: 'resume', cliSessionId, lastPrompt })
+      activeRunId.current = result.runId
+      setRunId(result.runId)
+      lastExitCodeRef.current = null
+      void refreshGitInfo()
+    } catch (error) {
+      setMessages((items) => items.map((message) => message.id === pendingId ? { ...message, pending: false, content: error instanceof Error ? error.message : String(error) } : message))
+    }
+  }
+
+  const retryLastAction = async () => {
+    if (runId || !window.agentDock) return
+    setPrompt('')
+    setRawOutput('')
+    const pendingId = crypto.randomUUID()
+    const retryPrompt = lastPrompt || 'Retry the last action.'
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Retry: ${retryPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+    try {
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: retryPrompt, workspace, attachments, mode: 'retry' })
+      activeRunId.current = result.runId
+      setRunId(result.runId)
+      lastExitCodeRef.current = null
     } catch (error) {
       setMessages((items) => items.map((message) => message.id === pendingId ? { ...message, pending: false, content: error instanceof Error ? error.message : String(error) } : message))
     }
@@ -650,7 +723,7 @@ export default function App() {
           {view === 'chat' && <button className="workspace-picker" onClick={chooseWorkspace} disabled={Boolean(runId)} title="Start a session in another project"><Folder size={14} /><span>{workspaceName(workspace)}</span><ChevronDown size={13} /></button>}
           <button className="icon-button"><Search size={17} /></button>
           <MoreMenuTrigger open={moreMenuOpen} onClick={() => setMoreMenuOpen(!moreMenuOpen)} />
-          <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} />
+          <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} canRestart={view === 'chat' && !runId} canResume={view === 'chat' && !runId && Boolean(cliSessionId)} canRetry={view === 'chat' && !runId && lastRunFailed} onRestart={() => { setMoreMenuOpen(false); void restartAgent() }} onResume={() => { setMoreMenuOpen(false); void resumeSession() }} onRetry={() => { setMoreMenuOpen(false); void retryLastAction() }} />
         </div>
 
         {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits }} sessionTitle={sessionTitle(messages)} />}

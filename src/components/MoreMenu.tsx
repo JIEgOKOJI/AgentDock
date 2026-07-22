@@ -1,11 +1,17 @@
 import { useEffect, useRef } from 'react'
-import { Globe, MoreHorizontal, X } from 'lucide-react'
+import { Globe, MoreHorizontal, Play, RotateCcw, X } from 'lucide-react'
 
-export function MoreMenu({ open, onClose, onOpenBrowser, browserOpen }: {
+export function MoreMenu({ open, onClose, onOpenBrowser, browserOpen, canRestart, canResume, canRetry, onRestart, onResume, onRetry }: {
   open: boolean
   onClose: () => void
   onOpenBrowser: () => void
   browserOpen: boolean
+  canRestart?: boolean
+  canResume?: boolean
+  canRetry?: boolean
+  onRestart?: () => void
+  onResume?: () => void
+  onRetry?: () => void
 }) {
   const root = useRef<HTMLDivElement>(null)
 
@@ -25,6 +31,19 @@ export function MoreMenu({ open, onClose, onOpenBrowser, browserOpen }: {
       <Globe size={15} />
       <span>{browserOpen ? 'Show embedded browser' : 'Open embedded browser'}</span>
     </button>
+    {canRestart && <hr className="more-menu-divider" />}
+    {canRestart && <button className="more-menu-item" role="menuitem" onClick={onRestart}>
+      <RotateCcw size={15} />
+      <span>Restart agent</span>
+    </button>}
+    {canResume && <button className="more-menu-item" role="menuitem" onClick={onResume}>
+      <Play size={15} />
+      <span>Resume session</span>
+    </button>}
+    {canRetry && <button className="more-menu-item" role="menuitem" onClick={onRetry}>
+      <RotateCcw size={15} />
+      <span>Retry last action</span>
+    </button>}
   </div>
 }
 
