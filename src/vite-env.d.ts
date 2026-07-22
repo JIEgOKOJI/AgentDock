@@ -145,6 +145,28 @@ interface GitInfo {
   branches: string[]
 }
 
+interface LaneState {
+  cliSessionId: string
+  lastPrompt: string
+  lastExitCode: number | null
+  lastRunFailed: boolean
+}
+
+interface RunReceipt {
+  runId: string
+  sessionId: string
+  provider: string
+  profileId: string
+  mode: string
+  prompt: string
+  exitCode: number | null
+  outcome: 'success' | 'blocked' | 'needs_human' | 'cost_unverifiable' | 'exhausted_overshoot'
+  filesChanged: Array<{ path: string; additions: number; deletions: number }>
+  usage: TokenUsage | null
+  startedAt: number
+  finishedAt: number
+}
+
 interface ChatSession {
   id: string
   title: string
@@ -159,10 +181,7 @@ interface ChatSession {
   attachments?: string[]
   git?: GitInfo
   usage?: TokenUsage
-  cliSessionId?: string
-  lastPrompt?: string
-  lastExitCode?: number | null
-  lastRunFailed?: boolean
+  lanes: Record<string, LaneState>
   createdAt: number
   updatedAt: number
 }
@@ -265,6 +284,18 @@ interface Window {
     removeProfile(id: string): Promise<boolean>
     toggleProfile(request: { id: string; enabled: boolean }): Promise<CredentialProfile | null>
     listSessions(): Promise<ChatSession[]>
+    getLaneState(sessionId: string, provider: ProviderId, profileId?: string): Promise<LaneState>
+    listRuns(sessionId?: string): Promise<RunReceipt[]>
+    readRunArtifact(runId: string, artifactPath: string): Promise<string | null>
+    prepareContinuity(request: {
+      sessionId: string
+      fromProvider: ProviderId
+      fromProfileId?: string
+      toProvider: ProviderId
+      toProfileId?: string
+      messages: ChatMessage[]
+    }): Promise<{ packetPath: string; threadFilePath: string; event: Record<string, unknown> & { type: string } } | null>
+    saveCheckpoint(request: { sessionId: string; provider: ProviderId; profileId?: string; content: string }): Promise<boolean>
     createSession(request: Partial<ChatSession> & { workspace: string }): Promise<ChatSession>
     updateSession(request: ChatSession): Promise<ChatSession>
     chooseWorkspace(): Promise<string | null>
@@ -287,6 +318,7 @@ interface Window {
       cliSessionId?: string
       lastPrompt?: string
       profileId?: string
+      sessionId?: string
     }): Promise<{ runId: string }>
     stopAgent(runId: string): Promise<boolean>
     browser: BrowserApi

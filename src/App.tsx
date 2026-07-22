@@ -13,7 +13,7 @@ import { McpManagerView } from './components/McpManagerView'
 import { ProfilesView } from './components/ProfilesView'
 
 type ProviderId = 'codex' | 'claude' | 'opencode'
-type ViewId = 'chat' | 'providers' | 'profiles' | 'mcp' | 'mcp-manager' | 'skills' | 'settings'
+type ViewId = 'chat' | 'providers' | 'profiles' | 'mcp' | 'mcp-manager' | 'skills' | 'runs' | 'settings'
 type Message = ChatMessage
 
 const providerMeta: Record<ProviderId, { name: string; badge: string; color: string }> = {
@@ -41,6 +41,7 @@ const nav = [
   { id: 'mcp' as ViewId, label: 'MCP servers', icon: PlugZap },
   { id: 'mcp-manager' as ViewId, label: 'MCP manager', icon: Wrench },
   { id: 'skills' as ViewId, label: 'Skills', icon: Blocks },
+  { id: 'runs' as ViewId, label: 'Run artifacts', icon: FileDiff },
 ]
 
 const starterMessages: Message[] = [{
@@ -259,11 +260,13 @@ export default function App() {
   const [lastExitCode, setLastExitCode] = useState<number | null>(null)
   const [lastRunFailed, setLastRunFailed] = useState(false)
   const [rotationNotice, setRotationNotice] = useState<{ from: string; to: string } | null>(null)
+  const [typedEvents, setTypedEvents] = useState<Array<Record<string, unknown> & { type: string }>>([])
   const messagesEnd = useRef<HTMLDivElement>(null)
   const activeRunId = useRef<string | null>(null)
   const lastExitCodeRef = useRef<number | null>(null)
   const limitsRequestId = useRef(0)
   const suppressSessionSave = useRef(true)
+  const lastLaneRef = useRef<string | null>(null)
 
   const restoreSession = (session: ChatSession, catalog = runtime) => {
     limitsRequestId.current += 1
@@ -290,11 +293,15 @@ export default function App() {
     setBranchError('')
     setUsage(session.usage ?? emptyTokenUsage())
     setLimits(undefined)
-    setCliSessionId(session.cliSessionId ?? null)
-    setLastPrompt(session.lastPrompt ?? '')
-    setLastExitCode(session.lastExitCode ?? null)
-    setLastRunFailed(session.lastRunFailed ?? false)
+    const lanes = session.lanes ?? {}
+    const laneKey = `${availableProvider}:${session.profileId ?? ''}`
+    const lane = lanes[laneKey] ?? { cliSessionId: '', lastPrompt: '', lastExitCode: null, lastRunFailed: false }
+    setCliSessionId(lane.cliSessionId || null)
+    setLastPrompt(lane.lastPrompt || '')
+    setLastExitCode(lane.lastExitCode ?? null)
+    setLastRunFailed(lane.lastRunFailed || false)
     setProfileId(session.profileId ?? null)
+    lastLaneRef.current = `${availableProvider}:${session.profileId ?? ''}`
     setView('chat')
   }
 
@@ -381,13 +388,23 @@ export default function App() {
       activeRunId.current = event.runId
       setRunId((current) => current ?? event.runId)
       if (event.type === 'stdout') {
-        const rotationMatch = event.data.match(/^\s*\n?(\{[^}]*"type":\s*"agentdock\.profile_rotated"[^}]*\})\s*\n?$/s)
-        if (rotationMatch) {
+        const typedMatch = event.data.match(/^\s*\n?(\{[^}]*"type":\s*"agentdock\.[^"]*"[^}]*\})\s*\n?$/s)
+        if (typedMatch) {
           try {
-            const payload = JSON.parse(rotationMatch[1])
-            if (payload.type === 'agentdock.profile_rotated' && payload.from && payload.to) setRotationNotice({ from: payload.from, to: payload.to })
+            const payload = JSON.parse(typedMatch[1])
+            if (payload.type === 'agentdock.profile_rotated' && payload.from && payload.to) {
+              setRotationNotice({ from: payload.from, to: payload.to })
+              return
+            }
+            if (payload.type === 'agentdock.run.outcome') {
+              setTypedEvents((items) => [...items, payload])
+              return
+            }
+            if (payload.type === 'agentdock.session.continuity') {
+              setTypedEvents((items) => [...items, payload])
+              return
+            }
           } catch {}
-          return
         }
         setRawOutput((value) => value + event.data)
       }
@@ -420,6 +437,9 @@ export default function App() {
       setMessages((items) => items.map((message) => message.pending ? { ...message, pending: false, content, activities: transcript.activities, files: transcript.finalFiles } : message))
       setRawOutput('')
       void refreshGitInfo()
+      if (activeSessionId && window.agentDock?.saveCheckpoint && content) {
+        window.agentDock.saveCheckpoint({ sessionId: activeSessionId, provider, profileId: profileId ?? '', content: content.slice(0, 4000) }).catch(() => {})
+      }
     }
   }, [runId, rawOutput, provider, model, runtime])
 
@@ -449,10 +469,15 @@ export default function App() {
         attachments,
         git: gitInfo ?? undefined,
         usage,
-        cliSessionId: cliSessionId ?? undefined,
-        lastPrompt: lastPrompt || undefined,
-        lastExitCode,
-        lastRunFailed: lastRunFailed || undefined,
+        lanes: {
+          ...existing.lanes,
+          [`${provider}:${profileId ?? ''}`]: {
+            cliSessionId: cliSessionId ?? '',
+            lastPrompt: lastPrompt || '',
+            lastExitCode: lastExitCode ?? null,
+            lastRunFailed: lastRunFailed || false,
+          },
+        },
         profileId: profileId ?? undefined,
         updatedAt: Date.now(),
       }
@@ -587,17 +612,38 @@ export default function App() {
       : `Continue from this provider-neutral conversation context:\n\n${portableContext}`)
     if (gitInfo?.currentBranch) contextBlocks.push(`Active git branch: ${gitInfo.currentBranch}`)
     if (attachments.length) contextBlocks.push(`Attached files:\n${attachments.map((file) => `- ${file}`).join('\n')}`)
+    const currentLane = `${provider}:${profileId ?? ''}`
+    const previousLane = lastLaneRef.current
+    if (activeSessionId && previousLane && previousLane !== currentLane && conversationMessages.length && window.agentDock?.prepareContinuity) {
+      try {
+        const [fromProvider, fromProfileId] = previousLane.split(':')
+        const continuity = await window.agentDock.prepareContinuity({
+          sessionId: activeSessionId,
+          fromProvider: fromProvider as ProviderId,
+          fromProfileId,
+          toProvider: provider,
+          toProfileId: profileId ?? '',
+          messages: conversationMessages,
+        })
+        if (continuity) {
+          contextBlocks.push(`<agentdock_continuation>\nA continuation packet was written to disk. Read this file for the full thread history and delta from the previous lane:\n${continuity.packetPath}\n</agentdock_continuation>`)
+          setTypedEvents((items) => [...items, continuity.event])
+        }
+      } catch {}
+    }
     const contextPrefix = contextBlocks.length
       ? `<agentdock_context>\n${contextBlocks.join('\n\n')}\n</agentdock_context>\n\n<user_request>\n${value}\n</user_request>`
       : value
-    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: value }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
+      setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: value }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
       if (!window.agentDock) throw new Error('Agent execution is available in the Electron app.')
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined })
+      setTypedEvents([])
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
       setAttachments([])
       activeRunId.current = result.runId
       setRunId(result.runId)
       setLastPrompt(value)
+      lastLaneRef.current = currentLane
       lastExitCodeRef.current = null
     } catch (error) {
       setMessages((items) => items.map((message) => message.id === pendingId ? { ...message, pending: false, content: error instanceof Error ? error.message : String(error) } : message))
@@ -612,7 +658,7 @@ export default function App() {
     const restartPrompt = lastPrompt || 'Continue working on the current task.'
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Restarting agent: ${restartPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: restartPrompt, workspace, attachments, mode: 'restart', profileId: profileId ?? undefined })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: restartPrompt, workspace, attachments, mode: 'restart', profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
       activeRunId.current = result.runId
       setRunId(result.runId)
       lastExitCodeRef.current = null
@@ -628,7 +674,7 @@ export default function App() {
     const pendingId = crypto.randomUUID()
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: 'Resume saved CLI session' }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: '', workspace, attachments, mode: 'resume', cliSessionId, lastPrompt, profileId: profileId ?? undefined })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: '', workspace, attachments, mode: 'resume', cliSessionId, lastPrompt, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
       activeRunId.current = result.runId
       setRunId(result.runId)
       lastExitCodeRef.current = null
@@ -646,7 +692,7 @@ export default function App() {
     const retryPrompt = lastPrompt || 'Retry the last action.'
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Retry: ${retryPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: retryPrompt, workspace, attachments, mode: 'retry', profileId: profileId ?? undefined })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: retryPrompt, workspace, attachments, mode: 'retry', profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
       activeRunId.current = result.runId
       setRunId(result.runId)
       lastExitCodeRef.current = null
@@ -749,12 +795,13 @@ export default function App() {
           <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} canRestart={view === 'chat' && !runId} canResume={view === 'chat' && !runId && Boolean(cliSessionId)} canRetry={view === 'chat' && !runId && lastRunFailed} onRestart={() => { setMoreMenuOpen(false); void restartAgent() }} onResume={() => { setMoreMenuOpen(false); void resumeSession() }} onRetry={() => { setMoreMenuOpen(false); void retryLastAction() }} />
         </div>
 
-        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null) }} sessionTitle={sessionTitle(messages)} />}
+        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null), typedEvents }} sessionTitle={sessionTitle(messages)} />}
         {view === 'providers' && <ProvidersView installed={installed} runtime={runtime} />}
         {view === 'profiles' && <ProfilesView />}
         {view === 'mcp' && <McpView servers={mcpServers} />}
         {view === 'mcp-manager' && <McpManagerView workspace={workspace} />}
         {view === 'skills' && <SkillsView workspace={workspace} />}
+        {view === 'runs' && <RunsView sessionId={activeSessionId} />}
         {view === 'settings' && <SettingsView workspace={workspace} contextHandoff={contextHandoff} onContextHandoffChange={async (enabled) => { setContextHandoff(enabled); try { await window.agentDock?.patchSettings({ contextHandoff: enabled }) } catch {} }} limitAction={limitAction} onLimitActionChange={async (action) => { setLimitAction(action); try { await window.agentDock?.patchSettings({ limitAction: action }) } catch {} }} />}
         <div ref={messagesEnd} />
         </main>
@@ -778,6 +825,7 @@ function ChatView(props: {
   usage: TokenUsage; limits: ProviderLimits | null | undefined; refreshLimits: () => void;
   profiles: CredentialProfile[]; profileId: string | null; setProfileId: (value: string | null) => void; profileMenu: boolean; setProfileMenu: (value: boolean) => void;
   rotationNotice: { from: string; to: string } | null; onDismissRotation: () => void;
+  typedEvents: Array<Record<string, unknown> & { type: string }>;
 }) {
   const meta = providerMeta[props.provider]
   const models = props.runtime[props.provider].models
@@ -788,6 +836,17 @@ function ChatView(props: {
   const attachmentPills = props.attachments.length > 0 || Boolean(props.gitInfo)
   const liveTranscript = useMemo(() => parseAgentTranscript(props.provider, props.rawOutput), [props.provider, props.rawOutput])
   const isNewSession = !props.messages.some((message) => message.role === 'user')
+  const lastAssistantId = useMemo(() => {
+    for (let i = props.messages.length - 1; i >= 0; i--) {
+      const message = props.messages[i]
+      if (message.role === 'assistant' && !message.pending && message.id !== 'hello') return message.id
+    }
+    return null
+  }, [props.messages])
+  const currentOutcome = useMemo(() => {
+    const outcomeEvent = props.typedEvents.find((event) => event.type === 'agentdock.run.outcome')
+    return typeof outcomeEvent?.outcome === 'string' ? outcomeEvent.outcome as string : null
+  }, [props.typedEvents])
   return <section className="chat-view">
     <div className="chat-scroll">
       <div className="conversation-heading"><div><span className="eyebrow"><GitBranch size={12} /> WORKSPACE SESSION</span><h1>{props.sessionTitle}</h1><p>One workspace. Any coding agent.</p></div></div>
@@ -798,7 +857,7 @@ function ChatView(props: {
         {props.messages.map((message) => <article key={message.id} className={`message ${message.role}`}>
           <div className="message-avatar">{message.role === 'user' ? 'JD' : <BrainCircuit size={17} />}</div>
           <div className="message-body">
-            <div className="message-meta"><strong>{message.role === 'user' ? 'You' : providerMeta[message.provider ?? props.provider].name}</strong><span>now</span>{message.provider && <em>{providerMeta[message.provider].badge}</em>}</div>
+            <div className="message-meta"><strong>{message.role === 'user' ? 'You' : providerMeta[message.provider ?? props.provider].name}</strong><span>now</span>{message.provider && <em>{providerMeta[message.provider].badge}</em>}{!message.pending && message.id === lastAssistantId && currentOutcome && <span className="outcome-badge" data-outcome={currentOutcome}>{currentOutcome}</span>}</div>
             {message.pending ? <>
               <div className="agent-started"><span className="running-dot" />{meta.name} начал работу…</div>
               {liveTranscript.activities.length ? <ActivityFeed activities={liveTranscript.activities} live /> : null}
@@ -1117,6 +1176,57 @@ function SkillsView({ workspace }: { workspace: string }) {
       </div>
     })}</div> : <div className="skills-message">{skills.length ? 'No skills match this filter.' : 'No skills found. Create one to add a portable SKILL.md workflow.'}</div>}
     <InfoStrip icon={<Sparkles size={18} />} title="Default global skills" text="Enabled skills are explicitly loaded before every request sent through AgentDock, for Codex, Claude Code, and OpenCode." />
+  </Page>
+}
+
+function RunsView({ sessionId }: { sessionId: string | null }) {
+  const [runs, setRuns] = useState<RunReceipt[]>([])
+  const [selected, setSelected] = useState<RunReceipt | null>(null)
+  const [artifact, setArtifact] = useState<string | null>(null)
+  const [artifactPath, setArtifactPath] = useState<string>('final/summary.md')
+
+  useEffect(() => {
+    if (!sessionId) { setRuns([]); return }
+    window.agentDock?.listRuns(sessionId).then(setRuns).catch(() => setRuns([]))
+  }, [sessionId])
+
+  useEffect(() => {
+    if (!selected) { setArtifact(null); return }
+    window.agentDock?.readRunArtifact(selected.runId, artifactPath).then(setArtifact).catch(() => setArtifact(null))
+  }, [selected, artifactPath])
+
+  return <Page title="Run artifacts" subtitle="Each run writes files — events.jsonl, patch.diff, summary.md, receipt.json. Files are the source of truth.">
+    <div className="runs-layout">
+      <div className="runs-list">
+        {runs.length === 0 && <div className="skills-message">No runs recorded yet for this session.</div>}
+        {runs.map((run) => (
+          <button key={run.runId} className={`run-item ${selected?.runId === run.runId ? 'active' : ''}`} onClick={() => { setSelected(run); setArtifactPath('final/summary.md') }}>
+            <div className="run-item-header">
+              <span className="run-outcome" data-outcome={run.outcome}>{run.outcome}</span>
+              <span className="run-provider">{providerMeta[run.provider as ProviderId]?.name || run.provider}</span>
+            </div>
+            <div className="run-item-prompt">{run.prompt.slice(0, 100) || run.mode}</div>
+            <div className="run-item-meta">
+              <span>{run.filesChanged.length} files</span>
+              <span>{relativeTime(run.finishedAt)}</span>
+            </div>
+          </button>
+        ))}
+      </div>
+      <div className="runs-detail">
+        {selected ? (
+          <>
+            <div className="runs-artifact-tabs">
+              <button className={artifactPath === 'final/summary.md' ? 'active' : ''} onClick={() => setArtifactPath('final/summary.md')}>summary.md</button>
+              <button className={artifactPath === 'final/patch.diff' ? 'active' : ''} onClick={() => setArtifactPath('final/patch.diff')}>patch.diff</button>
+              <button className={artifactPath === 'events.jsonl' ? 'active' : ''} onClick={() => setArtifactPath('events.jsonl')}>events.jsonl</button>
+              <button className={artifactPath === 'final/receipt.json' ? 'active' : ''} onClick={() => setArtifactPath('final/receipt.json')}>receipt.json</button>
+            </div>
+            <pre className="runs-artifact-content">{artifact ?? 'No artifact found.'}</pre>
+          </>
+        ) : <div className="skills-message">Select a run to inspect its artifacts.</div>}
+      </div>
+    </div>
   </Page>
 }
 

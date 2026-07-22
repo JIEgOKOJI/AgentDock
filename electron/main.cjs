@@ -18,6 +18,9 @@ const SESSION_STORE_VERSION = 1
 const SETTINGS_STORE_VERSION = 3
 const getCodexHome = () => process.env.CODEX_HOME || path.join(app.getPath('home'), '.codex')
 const { readProfiles, writeProfiles, normalizeProfile, profileEnvOverlay, findProfile, readyProfilesForProvider, isProfileExhausted, nextReadyProfile, detectDefaultProfiles, mergeProfiles } = require('./profiles.cjs')
+const { ensureLaneDir, normalizeLanes, getLaneState, setLaneState, migrateLegacySession } = require('./lanes.cjs')
+const { ensureRunDir, appendEvents, writePatch, writeSummary, writeReceipt, listRuns, readArtifact, buildDiffFromChanges, normalizeReceipt } = require('./artifacts.cjs')
+const { writeCheckpoint, readCheckpoint, writeThread, readThread, buildContinuationPacket, continuityEventPayload, laneLabel, buildThreadFromMessages } = require('./continuity.cjs')
 
 const DEFAULT_SETTINGS = { defaultGlobalSkills: [], contextHandoff: true, limitAction: 'fail' }
 
@@ -109,10 +112,7 @@ function normalizeSession(value) {
     ...(attachments.length ? { attachments } : {}),
     ...(git ? { git } : {}),
     ...(usage ? { usage } : {}),
-    ...(typeof value.cliSessionId === 'string' && value.cliSessionId ? { cliSessionId: value.cliSessionId } : {}),
-    ...(typeof value.lastPrompt === 'string' && value.lastPrompt ? { lastPrompt: value.lastPrompt } : {}),
-    ...(Number.isFinite(value.lastExitCode) ? { lastExitCode: value.lastExitCode } : {}),
-    ...(typeof value.lastRunFailed === 'boolean' ? { lastRunFailed: value.lastRunFailed } : {}),
+    lanes: normalizeLanes(value.lanes),
     createdAt: Number.isFinite(value.createdAt) ? value.createdAt : Date.now(),
     updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
   }
@@ -122,7 +122,7 @@ function readSessions() {
   try {
     const store = JSON.parse(fs.readFileSync(getSessionStorePath(), 'utf8'))
     if (store?.version !== SESSION_STORE_VERSION || !Array.isArray(store.sessions)) return []
-    return store.sessions.map(normalizeSession).filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt)
+    return store.sessions.map((session) => normalizeSession(migrateLegacySession(session))).filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt)
   } catch {
     return []
   }
@@ -773,6 +773,60 @@ ipcMain.handle('provider:limits', async (_event, request) => {
 
 ipcMain.handle('sessions:list', () => readSessions())
 
+ipcMain.handle('lanes:state', (_event, request = {}) => {
+  const sessionId = typeof request === 'string' ? request : request?.sessionId
+  if (!sessionId) return {}
+  const session = readSessions().find((item) => item.id === sessionId)
+  if (!session) return {}
+  const provider = typeof request === 'object' && request.provider ? request.provider : session.provider
+  const profileId = typeof request === 'object' && request.profileId ? request.profileId : session.profileId || ''
+  return getLaneState(session.lanes || {}, provider, profileId)
+})
+
+ipcMain.handle('runs:list', (_event, sessionId) => listRuns(app.getPath('userData'), typeof sessionId === 'string' ? sessionId : undefined))
+
+ipcMain.handle('runs:read-artifact', (_event, request = {}) => {
+  if (!request?.runId || !request?.path) return null
+  return readArtifact(app.getPath('userData'), request.runId, request.path)
+})
+
+ipcMain.handle('continuity:prepare', (_event, request = {}) => {
+  const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
+  if (!sessionId) return null
+  const fromProvider = typeof request?.fromProvider === 'string' ? request.fromProvider : ''
+  const fromProfileId = typeof request?.fromProfileId === 'string' ? request.fromProfileId : ''
+  const toProvider = typeof request?.toProvider === 'string' ? request.toProvider : ''
+  const toProfileId = typeof request?.toProfileId === 'string' ? request.toProfileId : ''
+  if (!fromProvider || !toProvider) return null
+  const fromLane = laneLabel(fromProvider, fromProfileId)
+  const toLane = laneLabel(toProvider, toProfileId)
+  if (fromLane === toLane) return null
+  const userData = app.getPath('userData')
+  const checkpoint = readCheckpoint(userData, sessionId, fromProvider, fromProfileId)
+  const messages = Array.isArray(request?.messages) ? request.messages : []
+  const threadContent = buildThreadFromMessages(messages, sessionId)
+  const threadFilePath = writeThread(userData, sessionId, threadContent)
+  if (!threadFilePath) return null
+  const packet = buildContinuationPacket({
+    fromLane, toLane, checkpoint, threadPath: threadFilePath,
+    deltaSummary: '', sessionId,
+  })
+  const packetPath = path.join(path.dirname(threadFilePath), `continuation-${Date.now()}.md`)
+  try { fs.writeFileSync(packetPath, packet, 'utf8') } catch { return null }
+  return { packetPath, threadFilePath, event: continuityEventPayload(fromLane, toLane, threadFilePath, 'lane_switch') }
+})
+
+ipcMain.handle('continuity:checkpoint', (_event, request = {}) => {
+  const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
+  if (!sessionId) return false
+  const provider = typeof request?.provider === 'string' ? request.provider : ''
+  const profileId = typeof request?.profileId === 'string' ? request.profileId : ''
+  const content = typeof request?.content === 'string' ? request.content : ''
+  if (!provider || !content) return false
+  writeCheckpoint(app.getPath('userData'), sessionId, provider, profileId, content)
+  return true
+})
+
 ipcMain.handle('sessions:create', (_event, request = {}) => {
   const workspace = path.resolve(request.workspace || app.getPath('home'))
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
@@ -872,6 +926,33 @@ ipcMain.handle('provider:configure', async (_event, provider) => {
   return true
 })
 
+function extractRunSummary(provider, raw) {
+  const answers = []
+  for (const line of String(raw || '').split(/\r?\n/).filter(Boolean)) {
+    try {
+      const event = JSON.parse(line)
+      if (provider === 'codex') {
+        const item = event.item || {}
+        if (item.type === 'agent_message' && item.text) answers.push(item.text)
+        if (event.type === 'message' && event.message?.content) answers.push(event.message.content)
+      } else if (provider === 'claude') {
+        const content = event.message?.content
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === 'text' && block.text) answers.push(block.text)
+          }
+        }
+        if (event.type === 'result' && event.result) answers.push(event.result)
+      } else {
+        const part = event.part || event
+        if (part.type === 'text' && part.text) answers.push(part.text)
+        if (!part.type && (event.text || event.content)) answers.push(event.text || event.content)
+      }
+    } catch {}
+  }
+  return answers.length ? answers[answers.length - 1].trim().slice(0, 5000) : ''
+}
+
 ipcMain.handle('agent:run', async (event, request) => {
   const adapter = adapters[request.provider]
   if (!adapter) throw new Error(`Unknown provider: ${request.provider}`)
@@ -882,10 +963,19 @@ ipcMain.handle('agent:run', async (event, request) => {
   const availableSkills = listSkills(workspace, app.getPath('home'), getCodexHome())
 
   const home = app.getPath('home')
-  const profiles = mergeProfiles(readProfiles(app.getPath('userData'), home), detectDefaultProfiles(home))
+  const userData = app.getPath('userData')
+  const profiles = mergeProfiles(readProfiles(userData, home), detectDefaultProfiles(home))
   const profile = findProfile(profiles, request.profileId)
   if (request.profileId && !profile) throw new Error('Selected credential profile is not available')
   const profileEnv = profile ? profileEnvOverlay(profile) : {}
+
+  const sessionId = request.sessionId || ''
+  const profileRef = profile ? profile.id : ''
+  // Keep AgentDock's lane data durable without replacing the CLI's native home.
+  // HOME/USERPROFILE also contain provider credentials and configuration. Pointing
+  // them at a newly-created lane made the default account appear logged out (most
+  // visibly OpenCode, whose auth.json lives below ~/.local/share/opencode).
+  if (sessionId) ensureLaneDir(userData, sessionId, request.provider, profileRef)
 
   const permissions = permissionLaunchOptions(request.provider, request.permissionMode, { ...process.env, ...profileEnv })
   const descriptor = browserMcpReady ? browserMcp.descriptor() : null
@@ -928,20 +1018,58 @@ ipcMain.handle('agent:run', async (event, request) => {
   }
   child.stdin.end()
   running.set(runId, { child, cleanup: browserOptions.cleanup })
+  ensureRunDir(userData, runId)
+  const startedAt = Date.now()
+  let rawOutput = ''
 
   const emit = (type, data = '') => {
     if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId, type, data })
   }
-  child.stdout.on('data', (chunk) => emit('stdout', chunk.toString()))
-  child.stderr.on('data', (chunk) => emit('stderr', chunk.toString()))
-  child.on('error', (error) => emit('error', error.message))
+  const appendArtifact = (type, data) => {
+    rawOutput += data
+    appendEvents(userData, runId, JSON.stringify({ ts: Date.now(), type, data }))
+  }
+  child.stdout.on('data', (chunk) => { const text = chunk.toString(); emit('stdout', text); appendArtifact('stdout', text) })
+  child.stderr.on('data', (chunk) => { const text = chunk.toString(); emit('stderr', text); appendArtifact('stderr', text) })
+  child.on('error', (error) => { emit('error', error.message); appendArtifact('error', error.message) })
   child.on('close', async (code) => {
     running.delete(runId)
     try { await browserOptions.cleanup() } catch {}
     const changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
-    if (changes.length) emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
-    emit('exit', String(code ?? -1))
-    if (code !== 0 && profile && readSettings().limitAction === 'rotate') {
+    if (changes.length) {
+      emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
+      appendArtifact('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
+    }
+    writePatch(userData, runId, buildDiffFromChanges(changes))
+    const summary = extractRunSummary(request.provider, rawOutput)
+    if (summary) writeSummary(userData, runId, summary)
+    const exitCode = Number.isFinite(code) ? code : -1
+    const outcome = exitCode === 0 ? 'success' : 'blocked'
+    writeReceipt(userData, runId, normalizeReceipt({
+      runId, sessionId, provider: request.provider, profileId: profileRef, mode,
+      prompt: request.prompt || request.lastPrompt || '',
+      exitCode, outcome,
+      filesChanged: changes.map((c) => ({ path: c.path, additions: c.additions, deletions: c.deletions })),
+      startedAt, finishedAt: Date.now(),
+    }))
+    const outcomeEvent = JSON.stringify({ type: 'agentdock.run.outcome', runId, outcome, exitCode, provider: request.provider, profileId: profileRef })
+    emit('stdout', `\n${outcomeEvent}\n`)
+    appendArtifact('stdout', `\n${outcomeEvent}\n`)
+    emit('exit', String(exitCode))
+    if (sessionId) {
+      try {
+        const sessions = readSessions()
+        const session = sessions.find((item) => item.id === sessionId)
+        if (session) {
+          const updatedLanes = setLaneState(session.lanes || {}, request.provider, profileRef, {
+            lastExitCode: exitCode,
+            lastRunFailed: exitCode !== 0,
+          })
+          writeSessions(sessions.map((item) => item.id === sessionId ? { ...item, lanes: updatedLanes, updatedAt: Date.now() } : item))
+        }
+      } catch {}
+    }
+    if (exitCode !== 0 && profile && readSettings().limitAction === 'rotate') {
       try {
         const providerLimits = request.provider === 'codex' ? await getCodexRateLimits({ ...process.env, ...profileEnv }) : request.provider === 'claude' ? await getClaudeRateLimits({ ...process.env, ...profileEnv }) : null
         if (providerLimits && isProfileExhausted(providerLimits)) {

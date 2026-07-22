@@ -1,1 +1,1 @@
-export function parseAgentTranscript(provider: ProviderId, raw: string): { content: string; activities: AgentActivity[]; finalFiles: FileChangeSummary[]; cliSessionId: string }
+export function parseAgentTranscript(provider: ProviderId, raw: string): { content: string; activities: AgentActivity[]; finalFiles: FileChangeSummary[]; cliSessionId: string; typedEvents: Array<Record<string, unknown> & { type: string; position: number }>; outcome: string | null }

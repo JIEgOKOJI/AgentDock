@@ -86,3 +86,38 @@ test('captures the OpenCode session id from any event carrying sessionID', async
   const result = parse('opencode', raw)
   assert.equal(result.cliSessionId, 'ses_077495d21ffeMcDtjcHVEMa0e2')
 })
+
+test('collects typed agentdock events and extracts run outcome', async () => {
+  const parse = await loadParser()
+  const raw = [
+    { type: 'item.completed', item: { type: 'agent_message', text: 'Done.' } },
+    { type: 'agentdock.run.outcome', runId: 'r1', outcome: 'success', exitCode: 0 },
+  ].map(JSON.stringify).join('\n')
+  const result = parse('codex', raw)
+  assert.equal(result.outcome, 'success')
+  assert.ok(result.typedEvents.length >= 1)
+  assert.equal(result.typedEvents[0].type, 'agentdock.run.outcome')
+})
+
+test('collects session.continuity typed events', async () => {
+  const parse = await loadParser()
+  const raw = [
+    { type: 'agentdock.session.continuity', from: 'codex:work', to: 'claude:personal', reason: 'lane_switch' },
+    { type: 'item.completed', item: { type: 'agent_message', text: 'Continuing.' } },
+  ].map(JSON.stringify).join('\n')
+  const result = parse('codex', raw)
+  assert.equal(result.typedEvents.length, 1)
+  assert.equal(result.typedEvents[0].type, 'agentdock.session.continuity')
+  assert.equal(result.typedEvents[0].from, 'codex:work')
+})
+
+test('collects profile_rotated typed events', async () => {
+  const parse = await loadParser()
+  const raw = [
+    { type: 'agentdock.profile_rotated', from: 'p1', to: 'p2', reason: 'quota_exhausted' },
+  ].map(JSON.stringify).join('\n')
+  const result = parse('claude', raw)
+  assert.equal(result.typedEvents.length, 1)
+  assert.equal(result.typedEvents[0].type, 'agentdock.profile_rotated')
+  assert.equal(result.typedEvents[0].to, 'p2')
+})

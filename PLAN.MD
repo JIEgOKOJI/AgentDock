@@ -35,7 +35,7 @@
 
 ---
 
-## 3. Continuation Packets (вместо наивной передачи 8 сообщений)
+## 3. Continuation Packets (вместо наивной передачи 8 сообщений) ✅ DONE
 
 **Что:** При lane-switch (смена harness/аккаунта) или gap (A→B→A) инжектить только delta-обороты с момента checkpoint'а lane, вербатим до byte-бюджета, далее — cached LLM summary или mechanical one-liners. Пакет пишется в файл (`context/THREAD.md`), промпт ссылается на абсолютный путь — тело не едет в промпте. Typed `session.continuity` event с раскрытием.
 
@@ -47,7 +47,7 @@
 
 ---
 
-## 4. Durable Per-Lane Homes
+## 4. Durable Per-Lane Homes ✅ DONE
 
 **Что:** Каждый (thread + harness + credential) получает свой scoped home вне worktree — native state (plan files, session rollouts, transcripts) не падает в `~`. Durable для thread-оборотов, disposable для one-shot.
 
@@ -59,7 +59,7 @@
 
 ---
 
-## 5. Run Artifacts as Files (events.jsonl, patch.diff, telemetry)
+## 5. Run Artifacts as Files (events.jsonl, patch.diff, telemetry) ✅ DONE
 
 **Что:** Каждый run создаёт файлы: `events.jsonl`, `final/patch.diff`, `final/summary.md`, `final/telemetry.yaml`, `reviews/*.yaml`, `arbitration/decision.yaml`. Файлы — источник истины, UI — проекция.
 
@@ -155,7 +155,7 @@
 
 ---
 
-## 13. Typed Events + Run Receipts
+## 13. Typed Events + Run Receipts ✅ DONE
 
 **Что:** Каждый claim (cost, quota, web evidence, auth route) — typed fact. Run завершается typed outcome (`success` | `blocked` | `needs_human` | `cost_unverifiable` | `exhausted_overshoot`). `session.continuity` event, `route.fallback.*`, `route.profile.rotated`, `web.unsatisfied` — все с structured payload.
 
@@ -196,7 +196,7 @@
 | Этап | Фичи | Фокус |
 |------|------|-------|
 | 1 | #1 Credential Profiles ✅, #2 Quota Rotation ✅ | Мультиаккаунтность — **этап завершён** |
-| 2 | #3 Continuation Packets, #4 Per-Lane Homes, #5 Run Artifacts, #13 Typed Events | Контекст + аудируемость |
+| 2 | #3 Continuation Packets ✅, #4 Per-Lane Homes ✅, #5 Run Artifacts ✅, #13 Typed Events ✅ | Контекст + аудируемость — **этап завершён** |
 | 3 | #6 Best-of-N, #7 Plan Lifecycle, #8 Council, #9 Gates, #10 Repair Loops, #11 Budget, #14 Worktree Envelopes | Оркестрация + безопасность |
 | 4 | #12 Delegation Belt, #15 Daemon | Архитектурная эволюция (опционально) |
 

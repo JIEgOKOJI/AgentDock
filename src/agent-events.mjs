@@ -12,6 +12,7 @@ function textDiff(before, after) {
 
 export function parseAgentTranscript(provider, raw) {
   const answers = [], activities = [], finalFiles = [], seenActivities = new Set(), sourceActivities = new Map()
+  const typedEvents = []
   let position = 0
   let lastActionPosition = -1
   let explicitSummary = ''
@@ -56,15 +57,23 @@ export function parseAgentTranscript(provider, raw) {
     }
   }
 
+  const collectTypedEvent = (payload) => {
+    if (!payload || typeof payload.type !== 'string' || !payload.type.startsWith('agentdock.')) return
+    typedEvents.push({ ...payload, position })
+  }
+
   for (const line of String(raw || '').split(/\r?\n/).filter(Boolean)) {
     position += 1
     let event
     try { event = JSON.parse(line) } catch { if (!line.startsWith('{')) answer(line); continue }
 
-    if (event.type === 'agentdock.file_changes') {
-      finalFiles.splice(0, finalFiles.length, ...(event.changes || []).filter((file) => file?.path).map((file) => ({
-        path: String(file.path), additions: Number(file.additions) || 0, deletions: Number(file.deletions) || 0, diff: asText(file.diff),
-      })))
+    if (event.type && event.type.startsWith('agentdock.')) {
+      collectTypedEvent(event)
+      if (event.type === 'agentdock.file_changes') {
+        finalFiles.splice(0, finalFiles.length, ...(event.changes || []).filter((file) => file?.path).map((file) => ({
+          path: String(file.path), additions: Number(file.additions) || 0, deletions: Number(file.deletions) || 0, diff: asText(file.diff),
+        })))
+      }
       continue
     }
 
@@ -122,5 +131,6 @@ export function parseAgentTranscript(provider, raw) {
 
   const finalAnswers = answers.filter((item) => item.position > lastActionPosition)
   const content = explicitSummary || (finalAnswers.length ? finalAnswers : answers.slice(-1)).map((item) => item.text).join('\n\n')
-  return { content, activities, finalFiles, cliSessionId }
+  const outcome = typedEvents.find((event) => event.type === 'agentdock.run.outcome')?.outcome || null
+  return { content, activities, finalFiles, cliSessionId, typedEvents, outcome }
 }
