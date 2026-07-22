@@ -6,6 +6,7 @@
 // so navigation invalidates stale element handles.
 
 const DEFAULT_TIMEOUT_MS = 15000
+const CDP_TIMEOUT_MS = 10000
 
 class AutomationError extends Error {
   constructor(code, message) {
@@ -37,26 +38,32 @@ function createBrowserAutomation(browserManager) {
     const webContents = browserManager.getWebContents()
     if (!webContents) throw new AutomationError('NO_BROWSER', 'No embedded browser is open')
     await ensureAttached(webContents)
-    return new Promise((resolve, reject) => {
-      webContents.debugger.sendCommand(method, params, (error, result) => {
-        if (error) reject(new AutomationError('CDP_ERROR', error.message || String(error)))
-        else resolve(result)
-      })
-    })
+    let timer
+    try {
+      return await Promise.race([
+        webContents.debugger.sendCommand(method, params),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new AutomationError('TIMEOUT', `CDP command ${method} timed out`)), CDP_TIMEOUT_MS)
+        }),
+      ])
+    } catch (error) {
+      if (error instanceof AutomationError) throw error
+      throw new AutomationError('CDP_ERROR', error && error.message ? error.message : String(error))
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   async function ensureAttached(webContents) {
-    if (attached) return
-    const target = webContents
-    if (!target.debugger.isAttached()) {
-      await new Promise((resolve, reject) => {
-        target.debugger.attach('1.3', () => {
-          if (target.debugger.isAttached()) resolve()
-          else reject(new AutomationError('CDP_ERROR', 'Failed to attach debugger'))
-        })
-      })
+    if (attached && webContents.debugger.isAttached()) return
+    try {
+      if (!webContents.debugger.isAttached()) webContents.debugger.attach('1.3')
+    } catch (error) {
+      attached = false
+      throw new AutomationError('CDP_ERROR', error && error.message ? error.message : 'Failed to attach debugger')
     }
-    attached = true
+    attached = webContents.debugger.isAttached()
+    if (!attached) throw new AutomationError('CDP_ERROR', 'Failed to attach debugger')
   }
 
   function detach() {
@@ -129,12 +136,52 @@ function createBrowserAutomation(browserManager) {
         const ref = makeRef(backendNodeId, node.frameId || null)
         refs.push({ ref, role, name, })
       }
+      const testIdResult = await cdpSend('Runtime.evaluate', {
+        expression: `JSON.stringify(Array.from(document.querySelectorAll('[data-testid]')).slice(0, 500).map((element) => ({
+          tag: element.tagName.toLowerCase(),
+          dataTestId: element.getAttribute('data-testid'),
+          id: element.id || undefined,
+          className: typeof element.className === 'string' ? element.className : undefined,
+          role: element.getAttribute('role') || undefined,
+          ariaLabel: element.getAttribute('aria-label') || undefined,
+          text: (element.innerText || element.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 500),
+        })))`,
+        returnByValue: true,
+      })
+      let dataTestIds = []
+      try { dataTestIds = JSON.parse(testIdResult?.result?.value || '[]') } catch {}
       return {
         url: state.url,
         title: state.title,
         revision: currentRevision,
         elements: refs,
+        dataTestIds,
       }
+    })
+  }
+
+  async function pageSource() {
+    return runExclusive(async () => {
+      const state = browserManager.getState()
+      if (!state) throw new AutomationError('NO_BROWSER', 'No embedded browser is open')
+      await waitForDocument(8000)
+      const result = await cdpSend('Runtime.evaluate', {
+        expression: `(() => {
+          const clone = document.documentElement.cloneNode(true)
+          clone.querySelectorAll('input').forEach((element) => element.removeAttribute('value'))
+          clone.querySelectorAll('textarea').forEach((element) => { element.textContent = '' })
+          const html = '<!doctype html>\\n' + clone.outerHTML
+          return JSON.stringify({
+            html: html.slice(0, 250000),
+            truncated: html.length > 250000,
+            text: (document.body?.innerText || '').slice(0, 100000),
+          })
+        })()`,
+        returnByValue: true,
+      })
+      let content
+      try { content = JSON.parse(result?.result?.value || '{}') } catch { content = {} }
+      return { url: state.url, title: state.title, ...content }
     })
   }
 
@@ -142,17 +189,31 @@ function createBrowserAutomation(browserManager) {
     return runExclusive(async () => {
       const state = browserManager.getState()
       if (!state) throw new AutomationError('NO_BROWSER', 'No embedded browser is open')
-      const result = await cdpSend('Page.captureScreenshot', { format: 'png' })
-      if (!result || !result.data) throw new AutomationError('CDP_ERROR', 'No screenshot data')
-      return { data: result.data, mimeType: 'image/png' }
+      await waitForDocument(8000)
+      const webContents = browserManager.getWebContents()
+      if (!webContents) throw new AutomationError('NO_BROWSER', 'No embedded browser is open')
+      let timer
+      try {
+        const image = await Promise.race([
+          webContents.capturePage(),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new AutomationError('TIMEOUT', 'Screenshot capture timed out')), CDP_TIMEOUT_MS)
+          }),
+        ])
+        if (!image || image.isEmpty()) throw new AutomationError('CAPTURE_ERROR', 'No screenshot data')
+        return { data: image.toPNG().toString('base64'), mimeType: 'image/png' }
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
     })
   }
 
   async function resolveNodeId(ref) {
     const entry = resolveRef(ref)
     const resolved = await cdpSend('DOM.resolveNode', { backendNodeId: entry.backendNodeId })
-    if (!resolved || !resolved.objectId) throw new AutomationError('ELEMENT_NOT_FOUND', `Could not resolve element ${ref}`)
-    return resolved.objectId
+    const objectId = resolved?.object?.objectId
+    if (!objectId) throw new AutomationError('ELEMENT_NOT_FOUND', `Could not resolve element ${ref}`)
+    return objectId
   }
 
   async function click(ref) {
@@ -160,8 +221,13 @@ function createBrowserAutomation(browserManager) {
       checkRevision()
       const objectId = await resolveNodeId(ref)
       await cdpSend('DOM.focus', { objectId })
-      await cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed', x: 0, y: 0, button: 'left', clickCount: 1 })
-      await cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 0, y: 0, button: 'left', clickCount: 1 })
+      const box = await cdpSend('DOM.getBoxModel', { objectId })
+      const quad = box?.model?.content || box?.model?.border
+      if (!Array.isArray(quad) || quad.length < 8) throw new AutomationError('ELEMENT_NOT_FOUND', `Could not locate element ${ref}`)
+      const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+      const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+      await cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 })
+      await cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 })
       return { ok: true }
     })
   }
@@ -244,6 +310,7 @@ function createBrowserAutomation(browserManager) {
 
   return {
     snapshot,
+    pageSource,
     screenshot,
     click,
     type,
@@ -258,4 +325,4 @@ function createBrowserAutomation(browserManager) {
   }
 }
 
-module.exports = { createBrowserAutomation, AutomationError, DEFAULT_TIMEOUT_MS }
+module.exports = { createBrowserAutomation, AutomationError, DEFAULT_TIMEOUT_MS, CDP_TIMEOUT_MS }

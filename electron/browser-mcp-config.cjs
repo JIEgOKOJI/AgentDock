@@ -113,6 +113,8 @@ You have a built-in browser capability through the agentdock-browser MCP server.
 It controls AgentDock's shared embedded browser.
 If the user refers to the open/current/embedded browser, inspect it with
 browser_get_state and browser_snapshot before answering or acting.
+Use browser_get_page_source when the user asks about page HTML, DOM, source
+code, rendered text, element attributes, or data-testid values.
 Use browser_open to verify completed web pages and to inspect example or
 reference web pages when that helps with the task.
 The page is visible to the user; require approval for sensitive actions.

@@ -28,6 +28,7 @@ function browserManagerStub() {
 function automationStub() {
   return {
     snapshot: async () => ({ revision: 1, url: 'https://example.test/', elements: [] }),
+    pageSource: async () => ({ url: 'https://example.test/', html: '<html></html>', text: '', truncated: false }),
     screenshot: async () => ({ data: '', mimeType: 'image/png' }),
     click: async () => {},
     type: async () => {},
@@ -56,11 +57,16 @@ test('browser MCP completes a stateful HTTP handshake and exposes tools', async 
   const names = result.tools.map((tool) => tool.name)
   assert.ok(names.includes('browser_get_state'))
   assert.ok(names.includes('browser_snapshot'))
+  assert.ok(names.includes('browser_get_page_source'))
   assert.ok(names.includes('browser_open'))
 
   const stateResult = await client.callTool({ name: 'browser_get_state', arguments: {} })
   assert.equal(stateResult.isError, undefined)
   assert.match(stateResult.content[0].text, /https:\/\/example\.test\//)
+
+  const sourceResult = await client.callTool({ name: 'browser_get_page_source', arguments: {} })
+  assert.equal(sourceResult.isError, undefined)
+  assert.match(sourceResult.content[0].text, /<html><\/html>/)
 })
 
 test('browser MCP rejects requests without its bearer token', async (t) => {

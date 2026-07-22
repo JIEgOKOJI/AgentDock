@@ -15,7 +15,7 @@ const { normalizeUrl } = require('./browser-url.cjs')
 const { AutomationError } = require('./browser-automation.cjs')
 
 const SERVER_NAME = 'agentdock-browser'
-const SERVER_VERSION = '0.1.0'
+const SERVER_VERSION = '0.2.0'
 
 function describeError(error) {
   if (error instanceof AutomationError) return { code: error.code, message: error.message }
@@ -84,12 +84,24 @@ function createBrowserMcp(browserManager, automation, options = {}) {
 
     server.tool(
       'browser_snapshot',
-      'Returns a live accessibility/DOM snapshot of the current page with element refs (e.g. e12) bound to the current page revision. Use browser_click/browser_type with these refs. Refs become stale after navigation.',
+      'Returns a live accessibility/DOM snapshot with interactive element refs and every data-testid found on the page. Use browser_click/browser_type with refs. Refs become stale after navigation.',
       {},
       async () => {
         try {
           const snapshot = await automation.snapshot()
           return { content: [{ type: 'text', text: JSON.stringify(snapshot) }] }
+        } catch (error) { return toolError(error) }
+      },
+    )
+
+    server.tool(
+      'browser_get_page_source',
+      'Returns the current page DOM HTML and visible text. Use this when the user asks about page source, markup, data-testid attributes, or rendered content. Current input and textarea values are removed.',
+      {},
+      async () => {
+        try {
+          const source = await automation.pageSource()
+          return { content: [{ type: 'text', text: JSON.stringify(source) }] }
         } catch (error) { return toolError(error) }
       },
     )
