@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Blocks, Bot, BrainCircuit, Check, ChevronDown, ChevronRight, CircleStop,
-  Command, Folder, GitBranch, Menu, MessageSquareText, RefreshCw,
+  Command, Folder, GitBranch, KeyRound, Menu, MessageSquareText, RefreshCw,
   PanelLeftClose, Paperclip, PlugZap, Plus, Search, Send, Settings, Sparkles,
   FileDiff, FileText, Hand, ShieldAlert, ShieldCheck, Share2, TerminalSquare, Wrench, X, Zap,
 } from 'lucide-react'
@@ -10,9 +10,10 @@ import { describeActivity } from './activity-format.mjs'
 import { MoreMenu, MoreMenuTrigger } from './components/MoreMenu'
 import { BrowserView } from './components/BrowserView'
 import { McpManagerView } from './components/McpManagerView'
+import { ProfilesView } from './components/ProfilesView'
 
 type ProviderId = 'codex' | 'claude' | 'opencode'
-type ViewId = 'chat' | 'providers' | 'mcp' | 'mcp-manager' | 'skills' | 'settings'
+type ViewId = 'chat' | 'providers' | 'profiles' | 'mcp' | 'mcp-manager' | 'skills' | 'settings'
 type Message = ChatMessage
 
 const providerMeta: Record<ProviderId, { name: string; badge: string; color: string }> = {
@@ -36,6 +37,7 @@ const fallbackRuntime: Record<ProviderId, ProviderRuntime> = {
 const nav = [
   { id: 'chat' as ViewId, label: 'Workspace', icon: MessageSquareText },
   { id: 'providers' as ViewId, label: 'Providers', icon: Bot },
+  { id: 'profiles' as ViewId, label: 'Profiles', icon: KeyRound },
   { id: 'mcp' as ViewId, label: 'MCP servers', icon: PlugZap },
   { id: 'mcp-manager' as ViewId, label: 'MCP manager', icon: Wrench },
   { id: 'skills' as ViewId, label: 'Skills', icon: Blocks },
@@ -244,14 +246,19 @@ export default function App() {
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [sessionsReady, setSessionsReady] = useState(false)
+  const [profiles, setProfiles] = useState<CredentialProfile[]>([])
+  const [profileId, setProfileId] = useState<string | null>(null)
+  const [profileMenu, setProfileMenu] = useState(false)
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>([])
   const [usage, setUsage] = useState<TokenUsage>(emptyTokenUsage)
   const [limits, setLimits] = useState<ProviderLimits | null | undefined>(undefined)
   const [contextHandoff, setContextHandoff] = useState(true)
+  const [limitAction, setLimitAction] = useState<'fail' | 'ask' | 'rotate'>('fail')
   const [cliSessionId, setCliSessionId] = useState<string | null>(null)
   const [lastPrompt, setLastPrompt] = useState<string>('')
   const [lastExitCode, setLastExitCode] = useState<number | null>(null)
   const [lastRunFailed, setLastRunFailed] = useState(false)
+  const [rotationNotice, setRotationNotice] = useState<{ from: string; to: string } | null>(null)
   const messagesEnd = useRef<HTMLDivElement>(null)
   const activeRunId = useRef<string | null>(null)
   const lastExitCodeRef = useRef<number | null>(null)
@@ -287,6 +294,7 @@ export default function App() {
     setLastPrompt(session.lastPrompt ?? '')
     setLastExitCode(session.lastExitCode ?? null)
     setLastRunFailed(session.lastRunFailed ?? false)
+    setProfileId(session.profileId ?? null)
     setView('chat')
   }
 
@@ -321,7 +329,8 @@ export default function App() {
       setSessionsReady(true)
     }).catch(() => setSessionsReady(true))
     window.agentDock?.getMcpServers().then(setMcpServers).catch(() => {})
-    window.agentDock?.getSettings().then((settings) => setContextHandoff(settings.contextHandoff)).catch(() => {})
+    window.agentDock?.getSettings().then((settings) => { setContextHandoff(settings.contextHandoff); setLimitAction(settings.limitAction ?? 'fail') }).catch(() => {})
+    window.agentDock?.listProfiles().then(setProfiles).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -371,7 +380,17 @@ export default function App() {
       if (activeRunId.current && event.runId !== activeRunId.current) return
       activeRunId.current = event.runId
       setRunId((current) => current ?? event.runId)
-      if (event.type === 'stdout') setRawOutput((value) => value + event.data)
+      if (event.type === 'stdout') {
+        const rotationMatch = event.data.match(/^\s*\n?(\{[^}]*"type":\s*"agentdock\.profile_rotated"[^}]*\})\s*\n?$/s)
+        if (rotationMatch) {
+          try {
+            const payload = JSON.parse(rotationMatch[1])
+            if (payload.type === 'agentdock.profile_rotated' && payload.from && payload.to) setRotationNotice({ from: payload.from, to: payload.to })
+          } catch {}
+          return
+        }
+        setRawOutput((value) => value + event.data)
+      }
       if (event.type === 'stderr') {
         const diagnostics = sanitizeDiagnostics(event.data)
         if (diagnostics) setRawOutput((value) => value + `\n${diagnostics}`)
@@ -434,13 +453,14 @@ export default function App() {
         lastPrompt: lastPrompt || undefined,
         lastExitCode,
         lastRunFailed: lastRunFailed || undefined,
+        profileId: profileId ?? undefined,
         updatedAt: Date.now(),
       }
       setSessions((items) => [snapshot, ...items.filter((item) => item.id !== snapshot.id)])
       window.agentDock?.updateSession(snapshot).catch(() => {})
     }, 350)
     return () => window.clearTimeout(timer)
-  }, [agent, activeSessionId, attachments, gitInfo, messages, model, permissionMode, provider, reasoning, sessionsReady, usage, workspace, cliSessionId, lastPrompt, lastExitCode, lastRunFailed])
+  }, [agent, activeSessionId, attachments, gitInfo, messages, model, permissionMode, provider, reasoning, sessionsReady, usage, workspace, cliSessionId, lastPrompt, lastExitCode, lastRunFailed, profileId])
 
   useEffect(() => {
     if (view === 'chat') void refreshGitInfo()
@@ -456,6 +476,7 @@ export default function App() {
     setUsage((current) => ({ ...current, contextTokens: 0, contextWindow: null }))
     setLimits(undefined)
     setProviderMenu(false)
+    if (profileId && !profiles.some((profile) => profile.id === profileId && profile.provider === id)) setProfileId(null)
   }
 
   const refreshLimits = async () => {
@@ -466,7 +487,7 @@ export default function App() {
       return
     }
     try {
-      const value = await window.agentDock.getProviderLimits(provider)
+      const value = await window.agentDock.getProviderLimits(provider, profileId ?? undefined)
       if (requestId === limitsRequestId.current) setLimits(value)
     } catch (error) {
       if (requestId === limitsRequestId.current) setLimits({ available: false, planType: null, limitName: null, primary: null, secondary: null, error: error instanceof Error ? error.message : String(error) })
@@ -572,7 +593,7 @@ export default function App() {
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: value }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
       if (!window.agentDock) throw new Error('Agent execution is available in the Electron app.')
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined })
       setAttachments([])
       activeRunId.current = result.runId
       setRunId(result.runId)
@@ -591,7 +612,7 @@ export default function App() {
     const restartPrompt = lastPrompt || 'Continue working on the current task.'
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Restarting agent: ${restartPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: restartPrompt, workspace, attachments, mode: 'restart' })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: restartPrompt, workspace, attachments, mode: 'restart', profileId: profileId ?? undefined })
       activeRunId.current = result.runId
       setRunId(result.runId)
       lastExitCodeRef.current = null
@@ -607,7 +628,7 @@ export default function App() {
     const pendingId = crypto.randomUUID()
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: 'Resume saved CLI session' }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: '', workspace, attachments, mode: 'resume', cliSessionId, lastPrompt })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: '', workspace, attachments, mode: 'resume', cliSessionId, lastPrompt, profileId: profileId ?? undefined })
       activeRunId.current = result.runId
       setRunId(result.runId)
       lastExitCodeRef.current = null
@@ -625,7 +646,7 @@ export default function App() {
     const retryPrompt = lastPrompt || 'Retry the last action.'
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', content: `Retry: ${retryPrompt}` }, { id: pendingId, role: 'assistant', provider, content: '', pending: true }])
     try {
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: retryPrompt, workspace, attachments, mode: 'retry' })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: retryPrompt, workspace, attachments, mode: 'retry', profileId: profileId ?? undefined })
       activeRunId.current = result.runId
       setRunId(result.runId)
       lastExitCodeRef.current = null
@@ -728,12 +749,13 @@ export default function App() {
           <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} canRestart={view === 'chat' && !runId} canResume={view === 'chat' && !runId && Boolean(cliSessionId)} canRetry={view === 'chat' && !runId && lastRunFailed} onRestart={() => { setMoreMenuOpen(false); void restartAgent() }} onResume={() => { setMoreMenuOpen(false); void resumeSession() }} onRetry={() => { setMoreMenuOpen(false); void retryLastAction() }} />
         </div>
 
-        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits }} sessionTitle={sessionTitle(messages)} />}
+        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null) }} sessionTitle={sessionTitle(messages)} />}
         {view === 'providers' && <ProvidersView installed={installed} runtime={runtime} />}
+        {view === 'profiles' && <ProfilesView />}
         {view === 'mcp' && <McpView servers={mcpServers} />}
         {view === 'mcp-manager' && <McpManagerView workspace={workspace} />}
         {view === 'skills' && <SkillsView workspace={workspace} />}
-        {view === 'settings' && <SettingsView workspace={workspace} contextHandoff={contextHandoff} onContextHandoffChange={async (enabled) => { setContextHandoff(enabled); try { await window.agentDock?.patchSettings({ contextHandoff: enabled }) } catch {} }} />}
+        {view === 'settings' && <SettingsView workspace={workspace} contextHandoff={contextHandoff} onContextHandoffChange={async (enabled) => { setContextHandoff(enabled); try { await window.agentDock?.patchSettings({ contextHandoff: enabled }) } catch {} }} limitAction={limitAction} onLimitActionChange={async (action) => { setLimitAction(action); try { await window.agentDock?.patchSettings({ limitAction: action }) } catch {} }} />}
         <div ref={messagesEnd} />
         </main>
         {browserVisible && <BrowserView onClose={() => setBrowserVisible(false)} />}
@@ -754,17 +776,23 @@ function ChatView(props: {
   newBranch: string; setNewBranch: (value: string) => void; branchError: string; setBranchError: (value: string) => void;
   selectBranch: (branch: string) => Promise<void>; addBranch: () => Promise<void>;
   usage: TokenUsage; limits: ProviderLimits | null | undefined; refreshLimits: () => void;
+  profiles: CredentialProfile[]; profileId: string | null; setProfileId: (value: string | null) => void; profileMenu: boolean; setProfileMenu: (value: boolean) => void;
+  rotationNotice: { from: string; to: string } | null; onDismissRotation: () => void;
 }) {
   const meta = providerMeta[props.provider]
   const models = props.runtime[props.provider].models
   const selectedModel = models.find((item) => item.id === props.model)
   const agents = props.runtime[props.provider].agents
+  const providerProfiles = props.profiles.filter((profile) => profile.provider === props.provider && profile.enabled)
+  const activeProfile = providerProfiles.find((profile) => profile.id === props.profileId) ?? null
   const attachmentPills = props.attachments.length > 0 || Boolean(props.gitInfo)
   const liveTranscript = useMemo(() => parseAgentTranscript(props.provider, props.rawOutput), [props.provider, props.rawOutput])
   const isNewSession = !props.messages.some((message) => message.role === 'user')
   return <section className="chat-view">
     <div className="chat-scroll">
       <div className="conversation-heading"><div><span className="eyebrow"><GitBranch size={12} /> WORKSPACE SESSION</span><h1>{props.sessionTitle}</h1><p>One workspace. Any coding agent.</p></div></div>
+
+      {props.rotationNotice && <div className="rotation-banner"><RefreshCw size={14} /><div><strong>Profile rotated</strong><p>Quota exhausted on <code>{props.profiles.find((p) => p.id === props.rotationNotice!.from)?.name ?? props.rotationNotice!.from}</code>. Switch to <code>{props.profiles.find((p) => p.id === props.rotationNotice!.to)?.name ?? props.rotationNotice!.to}</code> for the next run.</p></div><button onClick={props.onDismissRotation}><X size={14} /></button></div>}
 
       <div className="messages">
         {props.messages.map((message) => <article key={message.id} className={`message ${message.role}`}>
@@ -828,6 +856,13 @@ function ChatView(props: {
             <button className="provider-button" onClick={() => props.setProviderMenu(!props.providerMenu)} disabled={Boolean(props.runId)}><span className="provider-logo" style={{ '--provider': meta.color } as React.CSSProperties}>{meta.badge}</span><span>{meta.name}</span><ChevronDown size={13} /></button>
             {props.providerMenu && <div className="provider-menu">{(Object.keys(providerMeta) as ProviderId[]).map((id) => <button key={id} onClick={() => props.chooseProvider(id)} disabled={!props.installed[id]}><span className="provider-logo" style={{ '--provider': providerMeta[id].color } as React.CSSProperties}>{providerMeta[id].badge}</span><span><strong>{providerMeta[id].name}</strong><small>{props.installed[id] ? 'Installed' : 'CLI not found'}</small></span>{id === props.provider && <Check size={15} />}</button>)}</div>}
           </div>
+          {providerProfiles.length > 0 && <div className="profile-select">
+            <button className="tool-pill" onClick={() => props.setProfileMenu(!props.profileMenu)} disabled={Boolean(props.runId)}><KeyRound size={13} /> {activeProfile ? activeProfile.name : 'Default account'} <ChevronDown size={12} /></button>
+            {props.profileMenu && <div className="profile-menu">
+              <button onClick={() => { props.setProfileId(null); props.setProfileMenu(false) }}><span className="profile-menu-dot" /><span><strong>Default account</strong><small>Uses the CLI&apos;s native {meta.name} configuration</small></span>{!props.profileId && <Check size={15} />}</button>
+              {providerProfiles.map((profile) => <button key={profile.id} onClick={() => { props.setProfileId(profile.id); props.setProfileMenu(false) }}><span className="profile-menu-dot" style={{ '--provider': meta.color } as React.CSSProperties} /><span><strong>{profile.name}</strong><small>{profile.configDir}</small></span>{profile.id === props.profileId && <Check size={15} />}</button>)}
+            </div>}
+          </div>}
           <select aria-label="Model" value={props.model} onChange={(e) => props.chooseModel(e.target.value)} disabled={!models.length || Boolean(props.runId)}>{models.length ? models.map((item) => <option key={item.id} value={item.id}>{item.label}</option>) : <option>No models found</option>}</select>
           {selectedModel?.reasoning.length ? <select aria-label="Reasoning level" value={props.reasoning} onChange={(e) => props.setReasoning(e.target.value)} disabled={Boolean(props.runId)}>{selectedModel.reasoning.map((item) => <option key={item} value={item}>{item}</option>)}</select> : null}
           <UsageIndicator provider={props.provider} usage={{ ...props.usage, contextWindow: props.usage.contextWindow || selectedModel?.contextWindow || null }} limits={props.limits} refreshLimits={props.refreshLimits} />
@@ -1085,9 +1120,20 @@ function SkillsView({ workspace }: { workspace: string }) {
   </Page>
 }
 
-function SettingsView({ workspace, contextHandoff, onContextHandoffChange }: { workspace: string; contextHandoff: boolean; onContextHandoffChange: (enabled: boolean) => void }) {
+function SettingsView({ workspace, contextHandoff, onContextHandoffChange, limitAction, onLimitActionChange }: { workspace: string; contextHandoff: boolean; onContextHandoffChange: (enabled: boolean) => void; limitAction: 'fail' | 'ask' | 'rotate'; onLimitActionChange: (action: 'fail' | 'ask' | 'rotate') => void }) {
   return <Page title="Settings" subtitle="Tune AgentDock for your machine and workflow.">
-    <div className="settings-card"><div className="setting-row"><span><strong>Default workspace</strong><small>New sessions start in this directory</small></span><code>{workspace}</code></div><div className="setting-row"><span><strong>Context handoff</strong><small>Generate a compact session summary (goal, plan, findings, changes) when switching providers or models, instead of forwarding the last 8 messages</small></span><label className="switch"><input type="checkbox" checked={contextHandoff} onChange={(event) => onContextHandoffChange(event.target.checked)} /><i /></label></div><div className="setting-row"><span><strong>Run confirmation</strong><small>Ask before an agent executes commands</small></span><label className="switch"><input type="checkbox" defaultChecked /><i /></label></div></div>
+    <div className="settings-card">
+      <div className="setting-row"><span><strong>Default workspace</strong><small>New sessions start in this directory</small></span><code>{workspace}</code></div>
+      <div className="setting-row"><span><strong>Context handoff</strong><small>Generate a compact session summary (goal, plan, findings, changes) when switching providers or models, instead of forwarding the last 8 messages</small></span><label className="switch"><input type="checkbox" checked={contextHandoff} onChange={(event) => onContextHandoffChange(event.target.checked)} /><i /></label></div>
+      <div className="setting-row"><span><strong>Run confirmation</strong><small>Ask before an agent executes commands</small></span><label className="switch"><input type="checkbox" defaultChecked /><i /></label></div>
+      <div className="setting-row"><span><strong>Quota limit action</strong><small>What happens when a credential profile hits its vendor usage limit during a run</small></span><div className="limit-action-select">
+        <select value={limitAction} onChange={(event) => onLimitActionChange(event.target.value as 'fail' | 'ask' | 'rotate')}>
+          <option value="fail">Fail the run</option>
+          <option value="ask">Ask before continuing</option>
+          <option value="rotate">Auto-rotate to next ready profile</option>
+        </select>
+      </div></div>
+    </div>
   </Page>
 }
 

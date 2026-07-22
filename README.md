@@ -79,6 +79,45 @@ The MCP manager is a separate view that treats MCP servers as first-class, cross
 
 Because the three CLIs expose different permission systems, the modes are equivalent at the UI level but their exact behavior remains provider-specific.
 
+### Credential profiles
+
+AgentDock can run several accounts of the same provider side by side, each in its own isolated configuration directory. This lets you keep a personal subscription and a work subscription available at the same time without logout/login cycles.
+
+**How it works.** Each profile is a named entry that points at a configuration directory on disk. When a run starts, AgentDock sets the provider's config-dir environment variable for that process only, so the CLI reads credentials and settings from the chosen directory instead of its default location:
+
+| Provider | Environment variable | Default directory |
+|---|---|---|
+| Codex | `CODEX_HOME` | `~/.codex` |
+| Claude Code | `CLAUDE_CONFIG_DIR` | `~/.claude` |
+| OpenCode | `OPENCODE_CONFIG_DIR` | `~/.config/opencode` |
+
+Profiles are stored in `profiles.json` inside Electron's `userData` directory. The Profiles view groups them by provider and shows the config directory each one is scoped to.
+
+**Auto-detection.** On first launch AgentDock scans the default directories for each provider. If it finds existing auth markers (`auth.json` for Codex, `.credentials.json` for Claude, `opencode.json` for OpenCode), it creates an auto-detected "Default account" profile automatically, so existing logins appear without any setup. Auto-detected profiles cannot be deleted, but they can be disabled.
+
+**Authenticating a new profile.** AgentDock never handles credentials directly — login is performed by the vendor CLI, scoped to the profile directory:
+
+1. Open the **Profiles** view and click **New profile**.
+2. Enter a name (e.g. "Work account"), pick the provider, and set the configuration directory (e.g. `~/.codex-work`).
+3. Save the profile.
+4. From a terminal, log in through the provider's own CLI with the config-dir environment variable pointing at the new directory:
+   ```bash
+   CODEX_HOME=~/.codex-work codex login        # Codex
+   CLAUDE_CONFIG_DIR=~/.claude-work claude     # Claude Code (login on first run)
+   OPENCODE_CONFIG_DIR=~/.config/opencode-work opencode auth login  # OpenCode
+   ```
+5. The profile is now ready. Select it from the profile chip in the composer before sending a prompt.
+
+**Selecting a profile.** A chip in the composer lists enabled profiles for the active provider. Choosing "Default account" runs the CLI with its native configuration (no env overlay). The selected profile is persisted with the session and restored on reopen.
+
+**Quota rotation.** When a run hits the vendor's usage limit for the active profile, AgentDock can automatically switch to the next enabled profile of the same provider. The behavior is controlled by the **Quota limit action** setting under Settings:
+
+- **Fail** — stop the run (default).
+- **Ask** — prompt before rotating.
+- **Auto-rotate** — silently switch to the next ready profile and emit a `profile_rotated` event so the UI can surface a banner.
+
+Rotation checks the per-profile rate limits through the provider's native CLI interface (`codex` / `claude`) with the profile's env overlay applied, so each account's quota is measured independently.
+
 ### Activity and usage
 
 AgentDock parses provider output into a shared activity model and shows commands, tool calls, reasoning when exposed, and changed-file summaries. Workspace changes are calculated from Git state before and after a run.

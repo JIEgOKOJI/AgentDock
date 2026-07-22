@@ -15,10 +15,11 @@ const mcp = require('./mcp-manager.cjs')
 
 const running = new Map()
 const SESSION_STORE_VERSION = 1
-const SETTINGS_STORE_VERSION = 2
+const SETTINGS_STORE_VERSION = 3
 const getCodexHome = () => process.env.CODEX_HOME || path.join(app.getPath('home'), '.codex')
+const { readProfiles, writeProfiles, normalizeProfile, profileEnvOverlay, findProfile, readyProfilesForProvider, isProfileExhausted, nextReadyProfile, detectDefaultProfiles, mergeProfiles } = require('./profiles.cjs')
 
-const DEFAULT_SETTINGS = { defaultGlobalSkills: [], contextHandoff: true }
+const DEFAULT_SETTINGS = { defaultGlobalSkills: [], contextHandoff: true, limitAction: 'fail' }
 
 const browserManager = createBrowserManager()
 const browserAutomation = createBrowserAutomation(browserManager)
@@ -56,6 +57,7 @@ function readSettings() {
     return {
       defaultGlobalSkills: Array.isArray(store.defaultGlobalSkills) ? [...new Set(store.defaultGlobalSkills.filter((id) => typeof id === 'string' && id.startsWith('global:')))] : [],
       contextHandoff: typeof store.contextHandoff === 'boolean' ? store.contextHandoff : true,
+      limitAction: store.limitAction === 'rotate' || store.limitAction === 'ask' ? store.limitAction : 'fail',
     }
   } catch {
     return { ...DEFAULT_SETTINGS }
@@ -103,6 +105,7 @@ function normalizeSession(value) {
     agent: typeof value.agent === 'string' ? value.agent : 'default',
     permissionMode: normalizePermissionMode(value.permissionMode),
     messages,
+    ...(typeof value.profileId === 'string' && value.profileId ? { profileId: value.profileId } : {}),
     ...(attachments.length ? { attachments } : {}),
     ...(git ? { git } : {}),
     ...(usage ? { usage } : {}),
@@ -284,8 +287,8 @@ async function getOpenCodeModels() {
   return fallbackModels.opencode
 }
 
-async function getClaudeRateLimits() {
-  const result = await execCapture('claude', ['--print', '--output-format', 'json', '/usage'], { timeout: 20000 })
+async function getClaudeRateLimits(env = process.env) {
+  const result = await execCapture('claude', ['--print', '--output-format', 'json', '/usage'], { timeout: 20000, env })
   const unavailable = (error) => ({ available: false, planType: null, limitName: null, primary: null, secondary: null, error })
   if (!result.ok) return unavailable(stripAnsi(result.stderr).trim() || 'Claude usage is unavailable')
   try {
@@ -307,9 +310,9 @@ async function getClaudeRateLimits() {
   }
 }
 
-function getCodexRateLimits() {
+function getCodexRateLimits(env = process.env) {
   return new Promise((resolve) => {
-    const child = spawn('codex', ['app-server', '--stdio'], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] })
+    const child = spawn('codex', ['app-server', '--stdio'], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env })
     let buffer = ''
     let finished = false
     const finish = (value) => {
@@ -619,8 +622,57 @@ ipcMain.handle('settings:get', () => readSettings())
 ipcMain.handle('settings:patch', (_event, request = {}) => {
   const settings = readSettings()
   if (typeof request.contextHandoff === 'boolean') settings.contextHandoff = request.contextHandoff
+  if (request.limitAction === 'fail' || request.limitAction === 'ask' || request.limitAction === 'rotate') settings.limitAction = request.limitAction
   writeSettings(settings)
   return settings
+})
+
+ipcMain.handle('profiles:list', () => {
+  const home = app.getPath('home')
+  const stored = readProfiles(app.getPath('userData'), home)
+  const detected = detectDefaultProfiles(home)
+  return mergeProfiles(stored, detected)
+})
+
+ipcMain.handle('profiles:upsert', (_event, request = {}) => {
+  if (!request || typeof request.id !== 'string' || typeof request.provider !== 'string') throw new Error('Profile id and provider are required')
+  if (!['codex', 'claude', 'opencode'].includes(request.provider)) throw new Error(`Unknown provider: ${request.provider}`)
+  const home = app.getPath('home')
+  const profiles = readProfiles(app.getPath('userData'), home)
+  const index = profiles.findIndex((profile) => profile.id === request.id)
+  const now = Date.now()
+  const seed = index >= 0 ? profiles[index] : { id: request.id, provider: request.provider, createdAt: now }
+  const candidate = normalizeProfile({
+    ...seed,
+    name: typeof request.name === 'string' ? request.name : seed.name,
+    provider: request.provider,
+    configDir: typeof request.configDir === 'string' ? request.configDir : seed.configDir,
+    enabled: typeof request.enabled === 'boolean' ? request.enabled : seed.enabled ?? true,
+    updatedAt: now,
+  }, home)
+  if (!candidate) throw new Error('Invalid profile definition')
+  if (index >= 0) profiles[index] = candidate
+  else profiles.push(candidate)
+  writeProfiles(app.getPath('userData'), profiles)
+  return candidate
+})
+
+ipcMain.handle('profiles:remove', (_event, id) => {
+  const profiles = readProfiles(app.getPath('userData'), app.getPath('home'))
+  const next = profiles.filter((profile) => profile.id !== id)
+  writeProfiles(app.getPath('userData'), next)
+  return profiles.length !== next.length
+})
+
+ipcMain.handle('profiles:toggle', (_event, request = {}) => {
+  const home = app.getPath('home')
+  const profiles = readProfiles(app.getPath('userData'), home)
+  const target = profiles.find((profile) => profile.id === request.id)
+  if (!target) return null
+  target.enabled = Boolean(request.enabled)
+  target.updatedAt = Date.now()
+  writeProfiles(app.getPath('userData'), profiles)
+  return target
 })
 
 ipcMain.handle('skills:create', async (_event, request = {}) => {
@@ -708,9 +760,14 @@ ipcMain.handle('skills:share', async (_event, request = {}) => {
   return { canceled: false, updated, backups }
 })
 
-ipcMain.handle('provider:limits', async (_event, provider) => {
-  if (provider === 'codex') return getCodexRateLimits()
-  if (provider === 'claude') return getClaudeRateLimits()
+ipcMain.handle('provider:limits', async (_event, request) => {
+  const provider = typeof request === 'string' ? request : request?.provider
+  const profileId = typeof request === 'string' ? null : request?.profileId
+  const profile = profileId ? findProfile(mergeProfiles(readProfiles(app.getPath('userData'), app.getPath('home')), detectDefaultProfiles(app.getPath('home'))), profileId) : null
+  const profileEnv = profile ? profileEnvOverlay(profile) : {}
+  const env = { ...process.env, ...profileEnv }
+  if (provider === 'codex') return getCodexRateLimits(env)
+  if (provider === 'claude') return getClaudeRateLimits(env)
   return { available: false, planType: null, limitName: null, primary: null, secondary: null }
 })
 
@@ -824,7 +881,13 @@ ipcMain.handle('agent:run', async (event, request) => {
   const changesBeforeRun = await readWorkspaceChanges(workspace)
   const availableSkills = listSkills(workspace, app.getPath('home'), getCodexHome())
 
-  const permissions = permissionLaunchOptions(request.provider, request.permissionMode, process.env)
+  const home = app.getPath('home')
+  const profiles = mergeProfiles(readProfiles(app.getPath('userData'), home), detectDefaultProfiles(home))
+  const profile = findProfile(profiles, request.profileId)
+  if (request.profileId && !profile) throw new Error('Selected credential profile is not available')
+  const profileEnv = profile ? profileEnvOverlay(profile) : {}
+
+  const permissions = permissionLaunchOptions(request.provider, request.permissionMode, { ...process.env, ...profileEnv })
   const descriptor = browserMcpReady ? browserMcp.descriptor() : null
   const runId = crypto.randomUUID()
   let browserOptions
@@ -833,7 +896,7 @@ ipcMain.handle('agent:run', async (event, request) => {
 
   if (mode === 'resume') {
     browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
-    const mergedEnv = { ...permissions.env, ...browserOptions.env, NO_COLOR: '1', FORCE_COLOR: '0' }
+    const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
     const resumePermissionArgs = request.provider === 'codex' ? browserOptions.args : [...permissions.args, ...browserOptions.args]
     const resumeLastPrompt = withBrowserAwarenessPrompt(request.lastPrompt || request.prompt || 'Continue from where we left off.')
     const resumeRequest = {
@@ -854,7 +917,7 @@ ipcMain.handle('agent:run', async (event, request) => {
     const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
     const prompt = withBrowserAwarenessPrompt(basePrompt)
     browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
-    const mergedEnv = { ...permissions.env, ...browserOptions.env, NO_COLOR: '1', FORCE_COLOR: '0' }
+    const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
     const mergedArgs = [...permissions.args, ...browserOptions.args]
     child = spawn(adapter.executable, adapter.buildArgs({ ...baseRequest, prompt, permissionArgs: mergedArgs }), {
       cwd: workspace,
@@ -878,6 +941,16 @@ ipcMain.handle('agent:run', async (event, request) => {
     const changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
     if (changes.length) emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
     emit('exit', String(code ?? -1))
+    if (code !== 0 && profile && readSettings().limitAction === 'rotate') {
+      try {
+        const providerLimits = request.provider === 'codex' ? await getCodexRateLimits({ ...process.env, ...profileEnv }) : request.provider === 'claude' ? await getClaudeRateLimits({ ...process.env, ...profileEnv }) : null
+        if (providerLimits && isProfileExhausted(providerLimits)) {
+          const allProfiles = mergeProfiles(readProfiles(app.getPath('userData'), app.getPath('home')), detectDefaultProfiles(app.getPath('home')))
+          const candidate = nextReadyProfile(allProfiles, request.provider, profile.id)
+          if (candidate) emit('stdout', `\n${JSON.stringify({ type: 'agentdock.profile_rotated', from: profile.id, to: candidate.id, reason: 'quota_exhausted' })}\n`)
+        }
+      } catch {}
+    }
   })
   return { runId }
 })

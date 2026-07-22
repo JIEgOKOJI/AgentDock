@@ -154,6 +154,7 @@ interface ChatSession {
   reasoning: string
   agent: string
   permissionMode: PermissionMode
+  profileId?: string
   messages: ChatMessage[]
   attachments?: string[]
   git?: GitInfo
@@ -170,6 +171,18 @@ interface AgentEvent {
   runId: string
   type: 'stdout' | 'stderr' | 'error' | 'exit'
   data: string
+}
+
+interface CredentialProfile {
+  id: string
+  name: string
+  provider: ProviderId
+  configDir: string
+  envVar: string
+  enabled: boolean
+  auto?: boolean
+  createdAt: number
+  updatedAt: number
 }
 
 interface BrowserTabState {
@@ -215,6 +228,7 @@ interface BrowserApi {
 interface AppSettings {
   defaultGlobalSkills: string[]
   contextHandoff: boolean
+  limitAction: 'fail' | 'ask' | 'rotate'
 }
 
 interface Window {
@@ -245,7 +259,11 @@ interface Window {
     createSkill(request: { workspace: string; scope: SkillInfo['scope'] }): Promise<string | null>
     openSkill(request: { workspace: string; path: string }): Promise<boolean>
     shareSkill(request: { workspace: string; id: string; path: string }): Promise<{ canceled: boolean; updated: number; backups: string[] }>
-    getProviderLimits(provider: ProviderId): Promise<ProviderLimits>
+    getProviderLimits(provider: ProviderId, profileId?: string): Promise<ProviderLimits>
+    listProfiles(): Promise<CredentialProfile[]>
+    upsertProfile(request: { id: string; name?: string; provider: ProviderId; configDir?: string; enabled?: boolean }): Promise<CredentialProfile>
+    removeProfile(id: string): Promise<boolean>
+    toggleProfile(request: { id: string; enabled: boolean }): Promise<CredentialProfile | null>
     listSessions(): Promise<ChatSession[]>
     createSession(request: Partial<ChatSession> & { workspace: string }): Promise<ChatSession>
     updateSession(request: ChatSession): Promise<ChatSession>
@@ -268,6 +286,7 @@ interface Window {
       mode?: 'run' | 'restart' | 'resume' | 'retry'
       cliSessionId?: string
       lastPrompt?: string
+      profileId?: string
     }): Promise<{ runId: string }>
     stopAgent(runId: string): Promise<boolean>
     browser: BrowserApi
