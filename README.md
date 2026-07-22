@@ -37,7 +37,7 @@ Each backend adapter converts a common run request into the arguments expected b
 
 Sessions are saved as versioned JSON in Electron's `userData` directory. A session records its workspace, transcript, selected provider and model, reasoning level, agent, permission mode, attachments, Git information, and token usage.
 
-When sending a prompt, AgentDock includes up to eight recent transcript messages as provider-neutral continuation context. This makes provider switching practical without depending on one CLI's native session format.
+When switching providers, AgentDock builds a **continuation packet** — the delta of transcript turns since the last lane checkpoint is written to a file (`context/THREAD.md`) and referenced by absolute path in the prompt, so the body is not embedded in-line. A cached LLM summary or mechanical one-liners cover older history beyond the byte budget. A typed `session.continuity` event records each lane switch. This makes provider switching practical without depending on one CLI's native session format and avoids re-sending the full transcript on every run.
 
 ### Restart, resume, and retry
 
@@ -117,6 +117,46 @@ Profiles are stored in `profiles.json` inside Electron's `userData` directory. T
 - **Auto-rotate** — silently switch to the next ready profile and emit a `profile_rotated` event so the UI can surface a banner.
 
 Rotation checks the per-profile rate limits through the provider's native CLI interface (`codex` / `claude`) with the profile's env overlay applied, so each account's quota is measured independently.
+
+### Per-lane homes
+
+Each (session × provider × profile) combination gets its own scoped home directory under `userData/lanes/<sessionId>/<provider>-<profile>/home`, passed to the CLI as `HOME` / `CODEX_HOME` / `CLAUDE_CONFIG_DIR`. Native CLI state (plan files, session rollouts, transcripts) no longer spills into `~`, and a per-lane `cliSessionId` makes `codex exec resume` / `claude --resume` reachable on the next lane turn instead of only within a single provider.
+
+### Run artifacts as files
+
+Every run is recorded as a directory `userData/runs/<runId>/` containing `events.jsonl`, `final/patch.diff` (the clean Git diff for the run), `final/summary.md`, `final/telemetry.yaml`, and — for council/race runs — `council/draft-*.md`, `reviews/*.yaml`, and `arbitration/decision.yaml`. Files are the source of truth and the session only stores a `runId` reference, so any run can be inspected, diffed, exported, or recovered independently of `sessions.json`.
+
+### Typed events and run receipts
+
+Each run ends with a typed outcome (`success` | `blocked` | `needs_human` | `cost_unverifiable` | `exhausted_overshoot`), and lifecycle signals (`session.continuity`, `route.fallback.*`, `route.profile.rotated`, `web.unsatisfied`) carry structured payloads instead of free-form text. The renderer surfaces an outcome badge per message and an expandable evidence panel, giving machine- and human-readable state instead of vibe interpretation of CLI output.
+
+### Plan lifecycle
+
+A run can be sent with intent `ask` (read-only question), `plan` (explore and propose, never implement), or `agent` (write). A `plan` run wraps the goal in "plan, do not implement" and parses a structured `## Open Questions` block (single/multi/text). The plan's readiness is `ready`, `needs_answers`, or `unverified`. **Implement** freezes the accepted plan as a content-hashed contract (`context/PLAN.md` outside the worktree) and verifies the hash before spawn, so the agent implements exactly the reviewed plan.
+
+### Council planning
+
+`plan --council` drafts a plan in parallel across N harnesses (round 1), persists each draft as a file-backed artifact (`council/draft-<harness>.md`), and a primary harness runs one merge iteration that references the draft files by absolute path rather than embedding their text. `## Open Questions` is parsed from the merged output, producing one unified plan and one question set.
+
+### Best-of-N race with cross-family review
+
+`agent:race` spawns N candidate runs in parallel, each through its own harness and (optionally) its own isolated Git worktree. Deterministic gates, cross-family review (a run through a different provider family with a "review this patch" prompt), and a scoring arbitration function pick a winner, and the winner's patch is auto-adopted into the live tree via `git apply`. A Compare tab shows candidate diffs side by side.
+
+### Deterministic gates and protected paths
+
+Post-run verification runs an explicit test argv (e.g. `npm test`). `protected_paths` globs (`migrations/**`, `**/*.env`) flag any touched file for human-approval — those changes are never auto-applied. Externally-granted test commands are invalidated when the config, argv, executable, script bytes, project, or profile changes.
+
+### Repair loops
+
+`--attempts N` runs a repair loop with a hard cap: spawn → run gates → if gates fail and attempts remain, re-spawn with the previous gate output inlined ("previous attempt failed because: …, fix it"). `--until-clean` removes the fixed cap and stops on clean gates, budget/quota exhaust, cancellation, or a no-progress stall (the same error three times in a row).
+
+### Budget and cost accounting
+
+`--max-usd N` sets an explicit cash cap; zero means a real zero, not "unknown". Unknown cost is never reported as `$0` — a run can end `cost_unverifiable` or `exhausted_overshoot` instead. A per-run spend ledger and per-profile attribution accumulate cost (Claude Pro = 0 marginal, API = per-token price) and block further runs at the cap. The composer exposes a budget field and a live spend indicator.
+
+### Isolated Git worktree envelopes
+
+Write runs can optionally execute in an isolated Git worktree under `userData/workspaces/<task>/<attempt>/tree`. The proven work product is a `git diff` captured in the worktree; the winner is auto-adopted into the live tree via `git apply --check` → apply. Non-Git projects auto-init a baseline commit. This keeps race candidates from clobbering each other, leaves no debris from failed runs, and gives a clean before/after diff. For non-race runs it is opt-in via an "isolated run" toggle; the default remains in-place execution.
 
 ### Activity and usage
 
@@ -200,13 +240,21 @@ electron/
   adapters.cjs         Provider-specific CLI argument builders
   permissions.cjs      Permission-mode mapping
   skills.cjs           Skill discovery, grouping, sharing, and prompt injection
+  artifacts.cjs        Run artifacts as files (events.jsonl, patch.diff, summary, telemetry)
+  plan.cjs             Plan lifecycle: ask/plan/agent intent, open questions, hashed contract
+  council.cjs          Parallel multi-harness plan drafting and merge
+  race.cjs             Best-of-N race: parallel candidates, review, arbitration, auto-adopt
+  gates.cjs            Deterministic test gates and protected-path approval
+  repair.cjs           Repair loops (--attempts / --until-clean) with stall detection
+  budget.cjs           Per-run cost accounting, cash caps, and spend ledger
+  worktree.cjs         Isolated Git worktree envelopes for write runs
   browser-url.cjs      URL normalization and bounds validation for the embedded browser
   browser-manager.cjs  WebContentsView lifecycle, state, navigation, and events
   browser-automation.cjs
-                        CDP attach, snapshot/refs, click/type/select/press/scroll/wait
+                       CDP attach, snapshot/refs, click/type/select/press/scroll/wait
   browser-mcp.cjs      Loopback HTTP MCP bridge with bearer token and tool schemas
   browser-mcp-config.cjs
-                        Ephemeral provider MCP injection and browser-awareness prompt
+                       Ephemeral provider MCP injection and browser-awareness prompt
   mcp-manager.cjs      Unified MCP catalog: store, import/sync to CLI configs, health, conflicts, export/import
 src/
   App.tsx              React interface and session workflow
@@ -214,10 +262,11 @@ src/
     MoreMenu.tsx       "More" dropdown with embedded-browser entry
     BrowserView.tsx    Browser chrome, address bar, bounds placeholder, agent-action bar
     McpManagerView.tsx Unified MCP manager UI: list, filters, editor, sync, health, conflicts, export/import
-  agent-events.mjs     Provider output normalization
+  agent-events.mjs     Provider output normalization and typed event lifecycle
   activity-format.mjs
                        Human-readable activity descriptions
-test/                  Node test suite for adapters, permissions, skills, browser URL/MCP config, event parsing, and MCP manager store/sync/health/conflicts
+test/                  Node test suite for adapters, permissions, skills, browser URL/MCP config,
+                      event parsing, MCP manager, plan, council, gates, repair, budget, race, and worktree
 test/fixtures/browser-site/
                        HTML fixture for integration testing of browser automation
 ```
@@ -227,7 +276,7 @@ The Electron main process owns filesystem access and child processes. The React 
 ## Current limitations
 
 - Session storage is local JSON and has no search or cloud synchronization.
-- Context transfer across providers uses recent transcript messages; native CLI session resume is supported within the same provider only.
+- Context transfer across providers uses continuation packets with a byte budget; very long histories are summarized or truncated to one-liners beyond the budget.
 - The embedded browser is single-tab; multi-tab support is planned.
 - Agent browser actions are visible but do not yet require per-action approval prompts (planned for a follow-up release).
 - `evaluateJavaScript` is intentionally not exposed to agents; cookies, localStorage, sessionStorage, password fields, and request headers are never shared with MCP.

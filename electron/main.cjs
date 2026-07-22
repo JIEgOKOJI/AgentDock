@@ -21,6 +21,13 @@ const { readProfiles, writeProfiles, normalizeProfile, profileEnvOverlay, findPr
 const { ensureLaneDir, normalizeLanes, getLaneState, setLaneState, migrateLegacySession } = require('./lanes.cjs')
 const { ensureRunDir, appendEvents, writePatch, writeSummary, writeReceipt, listRuns, readArtifact, buildDiffFromChanges, normalizeReceipt } = require('./artifacts.cjs')
 const { writeCheckpoint, readCheckpoint, writeThread, readThread, buildContinuationPacket, continuityEventPayload, laneLabel, buildThreadFromMessages } = require('./continuity.cjs')
+const { planPrefix, parseOpenQuestions, classifyPlanReadiness, writePlanContract, readPlanContract, verifyPlanHash, contentHash } = require('./plan.cjs')
+const { normalizeGatesConfig, checkProtectedPaths, runGateCommand, writeGateResult, evaluateGates } = require('./gates.cjs')
+const { normalizeRepairConfig, buildRepairPrompt, detectStall, shouldContinue, writeAttemptLog, repairEventPayload, MAX_ATTEMPTS } = require('./repair.cjs')
+const { estimateRunCost, normalizeBudget, checkBudget, appendSpendEntry, sessionSpend, readSpendLedger, totalSpend } = require('./budget.cjs')
+const { createWorktree, captureWorktreeDiff, applyPatch, removeWorktree, isGitRepo } = require('./worktree.cjs')
+const { normalizeRaceConfig, writeCandidateArtifact, normalizeCandidate, scoreCandidate, arbitrate, buildReviewPrompt, parseReviewResponse, writeArbitrationResult, raceEventPayload, selectProvidersForRace, ensureRaceDir } = require('./race.cjs')
+const { normalizeCouncilConfig, writeDraft, readDraft, listDrafts, buildMergePrompt, councilEventPayload, ensureCouncilDir } = require('./council.cjs')
 
 const DEFAULT_SETTINGS = { defaultGlobalSkills: [], contextHandoff: true, limitAction: 'fail' }
 
@@ -827,6 +834,37 @@ ipcMain.handle('continuity:checkpoint', (_event, request = {}) => {
   return true
 })
 
+ipcMain.handle('plan:read', (_event, request = {}) => {
+  const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
+  if (!sessionId) return null
+  return readPlanContract(app.getPath('userData'), sessionId)
+})
+
+ipcMain.handle('plan:verify-hash', (_event, request = {}) => {
+  const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
+  const hash = typeof request?.hash === 'string' ? request.hash : ''
+  if (!sessionId || !hash) return false
+  return verifyPlanHash(app.getPath('userData'), sessionId, hash)
+})
+
+ipcMain.handle('plan:adopt', (_event, request = {}) => {
+  const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
+  if (!sessionId) return null
+  const planText = typeof request?.planText === 'string' ? request.planText : ''
+  const answers = Array.isArray(request?.answers) ? request.answers.filter((a) => a && typeof a.text === 'string') : []
+  if (!planText) return null
+  const result = writePlanContract(app.getPath('userData'), sessionId, planText, answers)
+  if (!result) return null
+  return { hash: result.hash, path: result.path, readiness: classifyPlanReadiness(planText, parseOpenQuestions(planText)) }
+})
+
+ipcMain.handle('budget:spend', (_event, request = {}) => {
+  const sessionId = typeof request?.sessionId === 'string' ? request.sessionId : ''
+  if (!sessionId) return { total: 0, entries: [] }
+  const entries = readSpendLedger(app.getPath('userData'), sessionId)
+  return { total: totalSpend(entries), entries: entries.slice(-50) }
+})
+
 ipcMain.handle('sessions:create', (_event, request = {}) => {
   const workspace = path.resolve(request.workspace || app.getPath('home'))
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
@@ -953,12 +991,44 @@ function extractRunSummary(provider, raw) {
   return answers.length ? answers[answers.length - 1].trim().slice(0, 5000) : ''
 }
 
+function extractTokenUsage(provider, raw) {
+  const number = (value) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+  for (const line of String(raw || '').split(/\r?\n/).filter(Boolean)) {
+    try {
+      const event = JSON.parse(line)
+      if (provider === 'codex' && event.type === 'turn.completed' && event.usage) {
+        return {
+          inputTokens: number(event.usage.input_tokens),
+          cachedInputTokens: number(event.usage.cached_input_tokens),
+          outputTokens: number(event.usage.output_tokens),
+          reasoningTokens: number(event.usage.reasoning_output_tokens),
+          totalTokens: number(event.usage.input_tokens) + number(event.usage.output_tokens),
+        }
+      }
+      if (provider === 'claude' && event.type === 'result' && event.usage) {
+        const input = number(event.usage.input_tokens)
+        const cached = number(event.usage.cache_read_input_tokens) + number(event.usage.cache_creation_input_tokens)
+        const output = number(event.usage.output_tokens)
+        return { inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningTokens: 0, totalTokens: input + cached + output }
+      }
+      if (provider === 'opencode' && (event.type === 'step_finish' || event.type === 'step-finish') && event.part?.tokens) {
+        const t = event.part.tokens
+        return { inputTokens: number(t.input), cachedInputTokens: number(t.cache?.read) + number(t.cache?.write), outputTokens: number(t.output), reasoningTokens: number(t.reasoning), totalTokens: number(t.input) + number(t.output) + number(t.reasoning) }
+      }
+    } catch {}
+  }
+  return null
+}
+
 ipcMain.handle('agent:run', async (event, request) => {
   const adapter = adapters[request.provider]
   if (!adapter) throw new Error(`Unknown provider: ${request.provider}`)
   const workspace = path.resolve(request.workspace || process.cwd())
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
   const mode = request.mode === 'resume' || request.mode === 'restart' || request.mode === 'retry' ? request.mode : 'run'
+  const intent = request.intent === 'plan' || request.intent === 'ask' ? request.intent : 'agent'
+  const repairConfig = normalizeRepairConfig(request.repair)
+  const isolated = Boolean(request.isolated) && intent !== 'plan' && mode === 'run'
   const changesBeforeRun = await readWorkspaceChanges(workspace)
   const availableSkills = listSkills(workspace, app.getPath('home'), getCodexHome())
 
@@ -977,11 +1047,26 @@ ipcMain.handle('agent:run', async (event, request) => {
   // visibly OpenCode, whose auth.json lives below ~/.local/share/opencode).
   if (sessionId) ensureLaneDir(userData, sessionId, request.provider, profileRef)
 
+  let runCwd = workspace
+  let worktreeInfo = null
+  if (isolated) {
+    try {
+      worktreeInfo = await createWorktree(userData, sessionId || 'standalone', runId, workspace)
+      if (worktreeInfo.ok) {
+        runCwd = worktreeInfo.path
+      } else {
+        worktreeInfo = { ok: false, error: worktreeInfo.error, path: null }
+      }
+    } catch (error) {
+      worktreeInfo = { ok: false, error: error.message, path: null }
+    }
+  }
+
   const permissions = permissionLaunchOptions(request.provider, request.permissionMode, { ...process.env, ...profileEnv })
   const descriptor = browserMcpReady ? browserMcp.descriptor() : null
   const runId = crypto.randomUUID()
   let browserOptions
-  const baseRequest = { ...request, workspace, permissionArgs: permissions.args }
+  const baseRequest = { ...request, workspace: runCwd, permissionArgs: permissions.args }
   let child
 
   if (mode === 'resume') {
@@ -998,19 +1083,20 @@ ipcMain.handle('agent:run', async (event, request) => {
       permissionMode: request.permissionMode,
     }
     child = spawn(adapter.executable, adapter.buildResumeArgs(resumeRequest), {
-      cwd: workspace,
+      cwd: runCwd,
       env: mergedEnv,
       windowsHide: true,
       shell: false,
     })
   } else {
     const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
-    const prompt = withBrowserAwarenessPrompt(basePrompt)
+    const intentPrefix = planPrefix(intent)
+    const prompt = withBrowserAwarenessPrompt(intentPrefix + basePrompt)
     browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
     const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
     const mergedArgs = [...permissions.args, ...browserOptions.args]
     child = spawn(adapter.executable, adapter.buildArgs({ ...baseRequest, prompt, permissionArgs: mergedArgs }), {
-      cwd: workspace,
+      cwd: runCwd,
       env: mergedEnv,
       windowsHide: true,
       shell: false,
@@ -1021,6 +1107,7 @@ ipcMain.handle('agent:run', async (event, request) => {
   ensureRunDir(userData, runId)
   const startedAt = Date.now()
   let rawOutput = ''
+  const repairState = { attempt: 1, gateOutputs: [], cancelled: false, attempts: [] }
 
   const emit = (type, data = '') => {
     if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId, type, data })
@@ -1035,23 +1122,173 @@ ipcMain.handle('agent:run', async (event, request) => {
   child.on('close', async (code) => {
     running.delete(runId)
     try { await browserOptions.cleanup() } catch {}
-    const changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
+    let changes
+    let worktreeDiff = ''
+    if (worktreeInfo?.ok && worktreeInfo.path) {
+      try { worktreeDiff = await captureWorktreeDiff(worktreeInfo.path) } catch {}
+      changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
+      if (worktreeDiff) {
+        const applyResult = await applyPatch(workspace, worktreeDiff)
+        const wtEvent = JSON.stringify({ type: 'agentdock.worktree.applied', runId, ok: applyResult.ok, error: applyResult.error || '' })
+        emit('stdout', `\n${wtEvent}\n`)
+        appendArtifact('stdout', `\n${wtEvent}\n`)
+        if (applyResult.ok) {
+          changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
+        }
+      }
+      try { await removeWorktree(workspace, worktreeInfo.path) } catch {}
+    } else {
+      changes = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
+    }
     if (changes.length) {
       emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
       appendArtifact('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes })}\n`)
     }
     writePatch(userData, runId, buildDiffFromChanges(changes))
+    const gatesConfig = normalizeGatesConfig(request.gates)
+    let gateResult = null
+    if (intent !== 'plan' && (gatesConfig.testCommand || gatesConfig.protectedPaths.length)) {
+      const protectedResult = gatesConfig.protectedPaths.length
+        ? checkProtectedPaths(changes, gatesConfig.protectedPaths)
+        : { triggered: false, matchedPaths: [] }
+      let testResult = null
+      if (gatesConfig.testCommand && !protectedResult.triggered) {
+        emit('stdout', `\n${JSON.stringify({ type: 'agentdock.gates.running', runId, command: gatesConfig.testCommand })}\n`)
+        testResult = await runGateCommand(gatesConfig.testCommand, workspace)
+      }
+      const evaluation = evaluateGates({ testResult, protectedResult })
+      gateResult = {
+        runId,
+        testCommand: gatesConfig.testCommand,
+        testPassed: evaluation.testPassed,
+        testExitCode: testResult?.exitCode ?? null,
+        testStdout: testResult?.stdout?.slice(0, 5000) || '',
+        testStderr: testResult?.stderr?.slice(0, 5000) || '',
+        protectedPaths: protectedResult,
+        needsApproval: evaluation.needsApproval,
+        overall: evaluation.overall,
+      }
+      writeGateResult(userData, runId, gateResult)
+      const gateEvent = JSON.stringify({ type: 'agentdock.gates.result', runId, overall: gateResult.overall, needsApproval: gateResult.needsApproval, testPassed: gateResult.testPassed, protectedTriggered: gateResult.protectedPaths.triggered })
+      emit('stdout', `\n${gateEvent}\n`)
+      appendArtifact('stdout', `\n${gateEvent}\n`)
+      if (gateResult.overall === 'test_failed' && (repairConfig.attempts > 1 || repairConfig.untilClean) && !repairState.cancelled) {
+        repairState.gateOutputs.push(gateResult.testStderr || gateResult.testStdout || '')
+        repairState.attempts.push({ exitCode: code, gateOverall: gateResult.overall, gatePassed: false, gateOutput: gateResult.testStderr || gateResult.testStdout || '' })
+        const continueLoop = shouldContinue({
+          attempt: repairState.attempt,
+          attempts: repairConfig.attempts,
+          untilClean: repairConfig.untilClean,
+          lastGatePassed: false,
+          lastGateOutput: gateResult.testStderr || gateResult.testStdout || '',
+          gateOutputs: repairState.gateOutputs,
+          cancelled: repairState.cancelled,
+        })
+        if (continueLoop && repairState.attempt < MAX_ATTEMPTS) {
+          repairState.attempt += 1
+          const repairPromptText = buildRepairPrompt(request.prompt || request.lastPrompt || '', gateResult.testStderr || gateResult.testStdout || '', repairState.attempt)
+          const repairEvent = JSON.stringify(repairEventPayload(runId, repairState.attempt, gateResult.overall, 'gate_failed_retry'))
+          emit('stdout', `\n${repairEvent}\n`)
+          appendArtifact('stdout', `\n${repairEvent}\n`)
+          const repairBasePrompt = globalSkillPrompt(repairPromptText, availableSkills, readSettings().defaultGlobalSkills)
+          const repairPrompt = withBrowserAwarenessPrompt(repairBasePrompt)
+          const repairBrowserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
+          const repairMergedEnv = { ...permissions.env, ...repairBrowserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
+          const repairMergedArgs = [...permissions.args, ...repairBrowserOptions.args]
+          const repairChild = spawn(adapter.executable, adapter.buildArgs({ ...baseRequest, prompt: repairPrompt, permissionArgs: repairMergedArgs }), {
+            cwd: runCwd, env: repairMergedEnv, windowsHide: true, shell: false,
+          })
+          repairChild.stdin.end()
+          running.set(runId, { child: repairChild, cleanup: repairBrowserOptions.cleanup })
+          rawOutput = ''
+          repairChild.stdout.on('data', (chunk) => { const text = chunk.toString(); emit('stdout', text); appendArtifact('stdout', text) })
+          repairChild.stderr.on('data', (chunk) => { const text = chunk.toString(); emit('stderr', text); appendArtifact('stderr', text) })
+          repairChild.on('error', (error) => { emit('error', error.message); appendArtifact('error', error.message) })
+          repairChild.on('close', async (repairCode) => {
+            running.delete(runId)
+            try { await repairBrowserOptions.cleanup() } catch {}
+            const repairChanges = workspaceChangeDelta(changesBeforeRun, await readWorkspaceChanges(workspace, true))
+            if (repairChanges.length) {
+              emit('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes: repairChanges })}\n`)
+              appendArtifact('stdout', `\n${JSON.stringify({ type: 'agentdock.file_changes', changes: repairChanges })}\n`)
+            }
+            writePatch(userData, runId, buildDiffFromChanges(repairChanges))
+            let repairGateResult = null
+            if (gatesConfig.testCommand) {
+              const repairTestResult = await runGateCommand(gatesConfig.testCommand, workspace)
+              const repairEvaluation = evaluateGates({ testResult: repairTestResult, protectedResult: { triggered: false, matchedPaths: [] } })
+              repairGateResult = {
+                runId, testCommand: gatesConfig.testCommand,
+                testPassed: repairEvaluation.testPassed, testExitCode: repairTestResult?.exitCode ?? null,
+                testStdout: repairTestResult?.stdout?.slice(0, 5000) || '',
+                testStderr: repairTestResult?.stderr?.slice(0, 5000) || '',
+                protectedPaths: { triggered: false, matchedPaths: [] },
+                needsApproval: repairEvaluation.needsApproval, overall: repairEvaluation.overall,
+              }
+              writeGateResult(userData, runId, repairGateResult)
+              const rGateEvent = JSON.stringify({ type: 'agentdock.gates.result', runId, overall: repairGateResult.overall, needsApproval: repairGateResult.needsApproval, testPassed: repairGateResult.testPassed, protectedTriggered: false })
+              emit('stdout', `\n${rGateEvent}\n`)
+              appendArtifact('stdout', `\n${rGateEvent}\n`)
+            }
+            const repairSummary = extractRunSummary(request.provider, rawOutput)
+            if (repairSummary) writeSummary(userData, runId, repairSummary)
+            const repairExitCode = Number.isFinite(repairCode) ? repairCode : -1
+            let repairOutcome = repairExitCode === 0 ? 'success' : 'blocked'
+            if (repairGateResult && repairGateResult.needsApproval) repairOutcome = 'needs_human'
+            writeAttemptLog(userData, runId, [...repairState.attempts, { exitCode: repairExitCode, gateOverall: repairGateResult?.overall, gatePassed: repairGateResult?.testPassed, gateOutput: repairGateResult?.testStderr || repairGateResult?.testStdout || '' }])
+            const repairOutcomeEvent = JSON.stringify({ type: 'agentdock.run.outcome', runId, outcome: repairOutcome, exitCode: repairExitCode, provider: request.provider, profileId: profileRef, attempt: repairState.attempt })
+            emit('stdout', `\n${repairOutcomeEvent}\n`)
+            appendArtifact('stdout', `\n${repairOutcomeEvent}\n`)
+            emit('exit', String(repairExitCode))
+          })
+          return
+        }
+      }
+    }
     const summary = extractRunSummary(request.provider, rawOutput)
     if (summary) writeSummary(userData, runId, summary)
+    let planResult = null
+    if (intent === 'plan' && summary && sessionId) {
+      const openQuestions = parseOpenQuestions(summary)
+      const readiness = classifyPlanReadiness(summary, openQuestions)
+      planResult = writePlanContract(userData, sessionId, summary, [])
+      const planEvent = JSON.stringify({ type: 'agentdock.plan.result', runId, sessionId, readiness, openQuestions, hash: planResult?.hash || '', planPath: planResult?.path || '' })
+      emit('stdout', `\n${planEvent}\n`)
+      appendArtifact('stdout', `\n${planEvent}\n`)
+    }
     const exitCode = Number.isFinite(code) ? code : -1
-    const outcome = exitCode === 0 ? 'success' : 'blocked'
+    let outcome = exitCode === 0 ? 'success' : 'blocked'
+    if (gateResult && gateResult.needsApproval) outcome = 'needs_human'
     writeReceipt(userData, runId, normalizeReceipt({
       runId, sessionId, provider: request.provider, profileId: profileRef, mode,
+      intent,
       prompt: request.prompt || request.lastPrompt || '',
       exitCode, outcome,
       filesChanged: changes.map((c) => ({ path: c.path, additions: c.additions, deletions: c.deletions })),
       startedAt, finishedAt: Date.now(),
     }))
+    const budgetConfig = normalizeBudget(request.maxUsd)
+    if (sessionId) {
+      try {
+        const runUsage = extractTokenUsage(request.provider, rawOutput)
+        const costEstimate = estimateRunCost(request.provider, request.model, runUsage)
+        appendSpendEntry(userData, sessionId, {
+          runId, provider: request.provider, profileId: profileRef, model: request.model,
+          cost: costEstimate.cost, costType: costEstimate.type, unverifiable: costEstimate.unverifiable,
+          usage: runUsage || {},
+        })
+        if (budgetConfig.enabled) {
+          const spend = sessionSpend(userData, sessionId)
+          const budgetCheck = checkBudget(spend, budgetConfig)
+          const budgetEvent = JSON.stringify({ type: 'agentdock.budget.update', runId, sessionId, spend: Math.round(spend * 1_000_000) / 1_000_000, maxUsd: budgetConfig.maxUsd, remaining: budgetCheck.remaining, exceeded: budgetCheck.exceeded })
+          emit('stdout', `\n${budgetEvent}\n`)
+          appendArtifact('stdout', `\n${budgetEvent}\n`)
+          if (budgetCheck.exceeded && outcome === 'success') {
+            outcome = 'exhausted_overshoot'
+          }
+        }
+      } catch {}
+    }
     const outcomeEvent = JSON.stringify({ type: 'agentdock.run.outcome', runId, outcome, exitCode, provider: request.provider, profileId: profileRef })
     emit('stdout', `\n${outcomeEvent}\n`)
     appendArtifact('stdout', `\n${outcomeEvent}\n`)
@@ -1081,6 +1318,225 @@ ipcMain.handle('agent:run', async (event, request) => {
     }
   })
   return { runId }
+})
+
+async function runCouncilDraft({ provider, request, workspace, userData, home, availableSkills, sessionId, emit, councilId }) {
+  const adapter = adapters[provider]
+  if (!adapter) return { provider, ok: false, summary: 'Adapter not found', path: null }
+  const profiles = mergeProfiles(readProfiles(userData, home), detectDefaultProfiles(home))
+  const profile = findProfile(profiles, request.profileId) || null
+  const profileEnv = profile ? profileEnvOverlay(profile) : {}
+  const permissions = permissionLaunchOptions(provider, request.permissionMode, { ...process.env, ...profileEnv })
+  const descriptor = browserMcpReady ? browserMcp.descriptor() : null
+  const draftRunId = crypto.randomUUID()
+  const browserOptions = browserMcpLaunchOptions(provider, descriptor, draftRunId, permissions.env)
+  const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
+  const mergedArgs = [...permissions.args, ...browserOptions.args]
+  const planPrefixText = planPrefix('plan')
+  const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
+  const prompt = withBrowserAwarenessPrompt(planPrefixText + basePrompt)
+  return new Promise((resolve) => {
+    const child = spawn(adapter.executable, adapter.buildArgs({ workspace, model: '', reasoning: '', agent: 'default', prompt, attachments: request.attachments || [], permissionArgs: mergedArgs }), {
+      cwd: workspace, env: mergedEnv, windowsHide: true, shell: false,
+    })
+    child.stdin.end()
+    running.set(draftRunId, { child, cleanup: browserOptions.cleanup })
+    let rawOutput = ''
+    child.stdout.on('data', (chunk) => { rawOutput += chunk.toString() })
+    child.stderr.on('data', (chunk) => { rawOutput += chunk.toString() })
+    child.on('close', async (code) => {
+      running.delete(draftRunId)
+      try { await browserOptions.cleanup() } catch {}
+      const summary = extractRunSummary(provider, rawOutput)
+      const draftPath = writeDraft(userData, sessionId, provider, summary)
+      emit('draft_completed', { councilId, provider, ok: code === 0, path: draftPath })
+      resolve({ provider, ok: code === 0, summary, path: draftPath })
+    })
+  })
+}
+
+ipcMain.handle('agent:council', async (event, request) => {
+  const workspace = path.resolve(request.workspace || process.cwd())
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
+  const councilConfig = normalizeCouncilConfig(request.council)
+  if (!councilConfig.enabled) throw new Error('Council mode is not enabled')
+  const home = app.getPath('home')
+  const userData = app.getPath('userData')
+  const sessionId = request.sessionId || ''
+  if (!sessionId) throw new Error('Session ID is required for council planning')
+  const availableSkills = listSkills(workspace, home, getCodexHome())
+  const councilId = crypto.randomUUID()
+  ensureCouncilDir(userData, sessionId)
+  const installedProviders = Object.keys(adapters)
+  const councilProviders = councilConfig.providers.length
+    ? councilConfig.providers.filter((p) => installedProviders.includes(p))
+    : installedProviders
+  if (councilProviders.length < 2) throw new Error('Council requires at least 2 providers')
+  const emit = (type, data = {}) => {
+    if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId: councilId, type: 'stdout', data: JSON.stringify(councilEventPayload(sessionId, type, { councilId, ...data })) })
+  }
+  emit('started', { providers: councilProviders })
+  const draftPromises = councilProviders.map((provider) =>
+    runCouncilDraft({ provider, request, workspace, userData, home, availableSkills, sessionId, emit, councilId })
+  )
+  const drafts = await Promise.all(draftPromises)
+  emit('all_drafts_completed', { count: drafts.filter((d) => d.ok).length })
+  const successfulDrafts = drafts.filter((d) => d.ok && d.path)
+  if (!successfulDrafts.length) {
+    emit('failed', { reason: 'no_successful_drafts' })
+    return { councilId, drafts, mergedPlan: null, openQuestions: [], readiness: 'unverified' }
+  }
+  const mergeProvider = councilProviders[0]
+  const mergeAdapter = adapters[mergeProvider]
+  if (!mergeAdapter) {
+    emit('failed', { reason: 'no_merge_adapter' })
+    return { councilId, drafts, mergedPlan: null, openQuestions: [], readiness: 'unverified' }
+  }
+  const draftPaths = successfulDrafts.map((d) => d.path)
+  const mergePrompt = buildMergePrompt(request.prompt, draftPaths)
+  const mergePermissions = permissionLaunchOptions(mergeProvider, request.permissionMode, { ...process.env })
+  const mergeDescriptor = browserMcpReady ? browserMcp.descriptor() : null
+  const mergeRunId = crypto.randomUUID()
+  const mergeBrowserOptions = browserMcpLaunchOptions(mergeProvider, mergeDescriptor, mergeRunId, mergePermissions.env)
+  const mergeEnv = { ...mergePermissions.env, ...mergeBrowserOptions.env, NO_COLOR: '1', FORCE_COLOR: '0' }
+  const mergeArgs = [...mergePermissions.args, ...mergeBrowserOptions.args]
+  const mergedPlan = await new Promise((resolve) => {
+    const mergeChild = spawn(mergeAdapter.executable, mergeAdapter.buildArgs({ workspace, model: '', reasoning: '', agent: 'default', prompt: mergePrompt, attachments: [], permissionArgs: mergeArgs }), {
+      cwd: workspace, env: mergeEnv, windowsHide: true, shell: false,
+    })
+    mergeChild.stdin.end()
+    running.set(mergeRunId, { child: mergeChild, cleanup: mergeBrowserOptions.cleanup })
+    let mergeRaw = ''
+    mergeChild.stdout.on('data', (chunk) => { mergeRaw += chunk.toString() })
+    mergeChild.stderr.on('data', (chunk) => { mergeRaw += chunk.toString() })
+    mergeChild.on('close', async () => {
+      running.delete(mergeRunId)
+      try { await mergeBrowserOptions.cleanup() } catch {}
+      resolve(extractRunSummary(mergeProvider, mergeRaw))
+    })
+  })
+  const openQuestions = parseOpenQuestions(mergedPlan)
+  const readiness = classifyPlanReadiness(mergedPlan, openQuestions)
+  const planContract = writePlanContract(userData, sessionId, mergedPlan, [])
+  emit('merge_completed', { readiness, openQuestionCount: openQuestions.length, hash: planContract?.hash || '' })
+  emit('exit', { councilId })
+  return { councilId, drafts, mergedPlan, openQuestions, readiness, hash: planContract?.hash || '', planPath: planContract?.path || '' }
+})
+
+async function runRaceCandidate({ event, raceId, candidateId, provider, profileId, request, workspace, userData, home, availableSkills, emit }) {
+  const adapter = adapters[provider]
+  if (!adapter) return normalizeCandidate({ candidateId, provider, exitCode: -1, patch: '', summary: 'Adapter not found' })
+  const profiles = mergeProfiles(readProfiles(userData, home), detectDefaultProfiles(home))
+  const profile = findProfile(profiles, profileId) || null
+  const profileEnv = profile ? profileEnvOverlay(profile) : {}
+  const permissions = permissionLaunchOptions(provider, request.permissionMode, { ...process.env, ...profileEnv })
+  const descriptor = browserMcpReady ? browserMcp.descriptor() : null
+  const candidateRunId = crypto.randomUUID()
+  const browserOptions = browserMcpLaunchOptions(provider, descriptor, candidateRunId, permissions.env)
+  const mergedEnv = { ...permissions.env, ...browserOptions.env, ...profileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
+  const mergedArgs = [...permissions.args, ...browserOptions.args]
+  const wtResult = await createWorktree(userData, request.sessionId || 'race', candidateRunId, workspace)
+  const runCwd = wtResult.ok ? wtResult.path : workspace
+  const basePrompt = globalSkillPrompt(request.prompt, availableSkills, readSettings().defaultGlobalSkills)
+  const prompt = withBrowserAwarenessPrompt(basePrompt)
+  return new Promise((resolve) => {
+    const child = spawn(adapter.executable, adapter.buildArgs({ workspace: runCwd, model: request.model, reasoning: request.reasoning, agent: request.agent || 'default', prompt, attachments: request.attachments || [], permissionArgs: mergedArgs }), {
+      cwd: runCwd, env: mergedEnv, windowsHide: true, shell: false,
+    })
+    child.stdin.end()
+    running.set(candidateRunId, { child, cleanup: browserOptions.cleanup })
+    let rawOutput = ''
+    child.stdout.on('data', (chunk) => { const text = chunk.toString(); rawOutput += text; emit('candidate_stdout', { candidateId, text }) })
+    child.stderr.on('data', (chunk) => { const text = chunk.toString(); rawOutput += text; emit('candidate_stderr', { candidateId, text }) })
+    child.on('error', (error) => { rawOutput += error.message })
+    child.on('close', async (code) => {
+      running.delete(candidateRunId)
+      try { await browserOptions.cleanup() } catch {}
+      let patch = ''
+      if (wtResult.ok && wtResult.path) {
+        try { patch = await captureWorktreeDiff(wtResult.path) } catch {}
+        try { await removeWorktree(workspace, wtResult.path) } catch {}
+      } else {
+        const changes = await readWorkspaceChanges(workspace, true)
+        patch = buildDiffFromChanges([...changes.values()])
+      }
+      const summary = extractRunSummary(provider, rawOutput)
+      const exitCode = Number.isFinite(code) ? code : -1
+      const candidate = normalizeCandidate({ candidateId, provider, profileId, runId: candidateRunId, exitCode, patch, summary, filesChanged: [] })
+      writeCandidateArtifact(userData, raceId, candidateId, 'patch.diff', patch)
+      writeCandidateArtifact(userData, raceId, candidateId, 'summary.md', summary)
+      resolve(candidate)
+    })
+  })
+}
+
+ipcMain.handle('agent:race', async (event, request) => {
+  const workspace = path.resolve(request.workspace || process.cwd())
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
+  const raceConfig = normalizeRaceConfig(request.race)
+  if (raceConfig.n < 2) throw new Error('Race requires at least 2 candidates')
+  const home = app.getPath('home')
+  const userData = app.getPath('userData')
+  const availableSkills = listSkills(workspace, home, getCodexHome())
+  const raceId = crypto.randomUUID()
+  ensureRaceDir(userData, raceId)
+  const installedProviders = Object.entries(adapters).filter(([id]) => {
+    return Object.keys(adapters).includes(id)
+  }).map(([id]) => id)
+  const raceProviders = selectProvidersForRace(raceConfig.n, raceConfig.providers, installedProviders)
+  const emit = (type, data = {}) => {
+    if (!event.sender.isDestroyed()) event.sender.send('agent:event', { runId: raceId, type: 'stdout', data: JSON.stringify(raceEventPayload(raceId, type, data)) })
+  }
+  emit('started', { n: raceConfig.n, providers: raceProviders })
+  const candidateIds = raceProviders.map((_, i) => `candidate-${i + 1}-${crypto.randomUUID().slice(0, 8)}`)
+  const candidatePromises = raceProviders.map((provider, i) =>
+    runRaceCandidate({ event, raceId, candidateId: candidateIds[i], provider, profileId: request.profileId, request, workspace, userData, home, availableSkills, emit })
+  )
+  const candidates = await Promise.all(candidatePromises)
+  emit('candidates_completed', { count: candidates.length })
+  if (raceConfig.review) {
+    for (const candidate of candidates) {
+      if (!candidate.patch || candidate.exitCode !== 0) continue
+      const reviewProvider = raceProviders.find((p) => p !== candidate.provider) || raceProviders[0]
+      if (!reviewProvider) continue
+      const reviewPrompt = buildReviewPrompt(candidate.patch, candidate.summary, request.prompt)
+      const reviewAdapter = adapters[reviewProvider]
+      if (!reviewAdapter) continue
+      const reviewProfileEnv = {}
+      const reviewPermissions = permissionLaunchOptions(reviewProvider, 'ask', { ...process.env, ...reviewProfileEnv })
+      const reviewDescriptor = browserMcpReady ? browserMcp.descriptor() : null
+      const reviewRunId = crypto.randomUUID()
+      const reviewBrowserOptions = browserMcpLaunchOptions(reviewProvider, reviewDescriptor, reviewRunId, reviewPermissions.env)
+      const reviewEnv = { ...reviewPermissions.env, ...reviewBrowserOptions.env, ...reviewProfileEnv, NO_COLOR: '1', FORCE_COLOR: '0' }
+      const reviewArgs = [...reviewPermissions.args, ...reviewBrowserOptions.args]
+      const reviewResult = await new Promise((resolve) => {
+        const reviewChild = spawn(reviewAdapter.executable, reviewAdapter.buildArgs({ workspace, model: '', reasoning: '', agent: 'default', prompt: reviewPrompt, attachments: [], permissionArgs: reviewArgs }), {
+          cwd: workspace, env: reviewEnv, windowsHide: true, shell: false,
+        })
+        reviewChild.stdin.end()
+        let reviewRaw = ''
+        reviewChild.stdout.on('data', (chunk) => { reviewRaw += chunk.toString() })
+        reviewChild.stderr.on('data', (chunk) => { reviewRaw += chunk.toString() })
+        reviewChild.on('close', () => {
+          const reviewSummary = extractRunSummary(reviewProvider, reviewRaw)
+          resolve(parseReviewResponse(reviewSummary))
+        })
+      })
+      candidate.review = reviewResult
+      writeCandidateArtifact(userData, raceId, candidate.candidateId, 'review.yaml', `verdict: ${reviewResult.verdict}\nquality: ${reviewResult.quality}\nnotes: ${reviewResult.notes}`)
+      emit('review_completed', { candidateId: candidate.candidateId, verdict: reviewResult.verdict })
+    }
+  }
+  for (const candidate of candidates) candidate.score = scoreCandidate(candidate)
+  const arbitration = arbitrate(candidates)
+  writeArbitrationResult(userData, raceId, arbitration)
+  if (raceConfig.autoAdopt && arbitration.winner?.patch) {
+    const applyResult = await applyPatch(workspace, arbitration.winner.patch)
+    emit('adopted', { winner: arbitration.winner.candidateId, provider: arbitration.winner.provider, ok: applyResult.ok, error: applyResult.error || '' })
+  }
+  emit('completed', { winner: arbitration.winner?.candidateId || 'none', reason: arbitration.reason })
+  emit('exit', { raceId })
+  return { raceId, winner: arbitration.winner, scores: arbitration.scores, candidates }
 })
 
 const killProcessTree = (child) => {

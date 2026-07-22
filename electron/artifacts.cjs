@@ -57,6 +57,7 @@ function normalizeReceipt(value) {
     provider: typeof value.provider === 'string' ? value.provider : '',
     profileId: typeof value.profileId === 'string' ? value.profileId : '',
     mode: typeof value.mode === 'string' ? value.mode : 'run',
+    intent: typeof value.intent === 'string' ? value.intent : 'agent',
     prompt: typeof value.prompt === 'string' ? value.prompt : '',
     exitCode: Number.isFinite(value.exitCode) ? value.exitCode : null,
     outcome: typeof value.outcome === 'string' ? value.outcome : 'success',
@@ -93,7 +94,7 @@ function listRuns(userData, sessionId) {
 }
 
 function readArtifact(userData, runId, relativePath) {
-  const allowed = ['events.jsonl', 'final/patch.diff', 'final/summary.md', 'final/receipt.json']
+  const allowed = ['events.jsonl', 'final/patch.diff', 'final/summary.md', 'final/receipt.json', 'gates/result.yaml', 'race/decision.yaml']
   if (!allowed.includes(relativePath)) return null
   try {
     return fs.readFileSync(path.join(runDir(userData, runId), ...relativePath.split('/')), 'utf8')

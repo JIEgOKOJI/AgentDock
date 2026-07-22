@@ -71,7 +71,7 @@
 
 ---
 
-## 6. Best-of-N Race с Cross-Family Review & Arbitration
+## 6. Best-of-N Race с Cross-Family Review & Arbitration ✅ DONE
 
 **Что:** `--n N` — N кандидатов в изолированных конвертах, каждый через свой harness. Deterministic gates, review (минимум 2 distinct provider families), synthesis, arbitration — выбор winner, auto-adopt его патча в live tree.
 
@@ -83,7 +83,7 @@
 
 ---
 
-## 7. Plan Lifecycle с Typed Open Questions
+## 7. Plan Lifecycle с Typed Open Questions ✅ DONE
 
 **Что:** `plan` run — read-only, оборачивает goal в "plan, do not implement". Завершается `final/plan.md` + structured `## Open Questions` (single/multi/text). Readiness: `ready` | `needs_answers` | `unverified`. Implement — отдельный agent-turn, замораживает plan как content-hashed contract (`context/PLAN.md` вне worktree), верифицирует hash перед spawn.
 
@@ -95,7 +95,7 @@
 
 ---
 
-## 8. Council Planning (параллельные мульти-harness драфты)
+## 8. Council Planning (параллельные мульти-harness драфты) ✅ DONE
 
 **Что:** `plan --council` — N harnesses draft планы параллельно (round 1), drafts как file-backed artifacts (`council/draft-<harness>.md`), primary делает one merge iteration (указывает на файлы по абсолютному пути, не embedит текст) → ONE unified plan. `## Open Questions` парсится на merge output.
 
@@ -107,7 +107,7 @@
 
 ---
 
-## 9. Deterministic Gates + Protected Paths
+## 9. Deterministic Gates + Protected Paths ✅ DONE
 
 **Что:** `--test '["npm","test"]'` — точный argv для пост-run верификации. `protected_paths` — globs (`migrations/**`, `**/*.env`), изменение которых эскалирует на human-approval gate, never auto-applied. Externally-granted test commands invalidated при изменении config/argv/executable/script bytes/project/profile.
 
@@ -119,7 +119,7 @@
 
 ---
 
-## 10. Repair Loops (--attempts / --until-clean)
+## 10. Repair Loops (--attempts / --until-clean) ✅ DONE
 
 **Что:** `--attempts N` — repair loop с хард-капом. `--until-clean` — без фиксированного капа, стоп на clean review/gates, budget/quota exhaust, cancellation, или no-progress stall.
 
@@ -131,7 +131,7 @@
 
 ---
 
-## 11. Budget / Cost Accounting (honest)
+## 11. Budget / Cost Accounting (honest) ✅ DONE
 
 **Что:** `--max-usd N` — явный cash cap, zero = real zero. Unknown cost никогда не `$0` — run может end `cost_unverifiable` или `exhausted_overshoot`. Per-run spend ledger, per-profile attribution.
 
@@ -167,7 +167,7 @@
 
 ---
 
-## 14. Isolated Git Worktree Envelopes for Write Runs
+## 14. Isolated Git Worktree Envelopes for Write Runs ✅ DONE
 
 **Что:** Write-runs выполняются в `~/.claudexor/v3/projects/<sha>/workspaces/<task>/<attempt>/tree` — isolated git worktree. Proven work product = git diff в worktree. Winner auto-adopt через `git apply --check` → apply. Non-git проект auto-init с baseline commit.
 
@@ -197,7 +197,7 @@
 |------|------|-------|
 | 1 | #1 Credential Profiles ✅, #2 Quota Rotation ✅ | Мультиаккаунтность — **этап завершён** |
 | 2 | #3 Continuation Packets ✅, #4 Per-Lane Homes ✅, #5 Run Artifacts ✅, #13 Typed Events ✅ | Контекст + аудируемость — **этап завершён** |
-| 3 | #6 Best-of-N, #7 Plan Lifecycle, #8 Council, #9 Gates, #10 Repair Loops, #11 Budget, #14 Worktree Envelopes | Оркестрация + безопасность |
+| 3 | #6 Best-of-N ✅, #7 Plan Lifecycle ✅, #8 Council ✅, #9 Gates ✅, #10 Repair Loops ✅, #11 Budget ✅, #14 Worktree Envelopes ✅ | Оркестрация + безопасность — **этап завершён** |
 | 4 | #12 Delegation Belt, #15 Daemon | Архитектурная эволюция (опционально) |
 
 ## Принципы адаптации

@@ -158,6 +158,7 @@ interface RunReceipt {
   provider: string
   profileId: string
   mode: string
+  intent: 'agent' | 'plan' | 'ask'
   prompt: string
   exitCode: number | null
   outcome: 'success' | 'blocked' | 'needs_human' | 'cost_unverifiable' | 'exhausted_overshoot'
@@ -190,6 +191,33 @@ interface AgentEvent {
   runId: string
   type: 'stdout' | 'stderr' | 'error' | 'exit'
   data: string
+}
+
+interface OpenQuestion {
+  id: string
+  kind: 'single' | 'multi' | 'text'
+  text: string
+}
+
+interface PlanResult {
+  readiness: 'ready' | 'needs_answers' | 'unverified'
+  openQuestions: OpenQuestion[]
+  hash: string
+  planPath: string
+}
+
+interface RaceCandidate {
+  candidateId: string
+  provider: string
+  profileId: string
+  runId: string
+  exitCode: number | null
+  patch: string
+  summary: string
+  filesChanged: Array<{ path: string; additions: number; deletions: number }>
+  gateResult: { testPassed: boolean; overall: string; needsApproval: boolean } | null
+  review: { verdict: 'approve' | 'reject' | 'needs_work'; quality: number; notes: string } | null
+  score: number
 }
 
 interface CredentialProfile {
@@ -315,12 +343,44 @@ interface Window {
       workspace: string
       attachments: string[]
       mode?: 'run' | 'restart' | 'resume' | 'retry'
+      intent?: 'agent' | 'plan' | 'ask'
       cliSessionId?: string
       lastPrompt?: string
       profileId?: string
       sessionId?: string
+      gates?: { testCommand: string[] | null; protectedPaths: string[] }
+      repair?: { attempts: number; untilClean: boolean }
+      maxUsd?: number
+      isolated?: boolean
     }): Promise<{ runId: string }>
     stopAgent(runId: string): Promise<boolean>
+    runRace(request: {
+      provider: ProviderId
+      model: string
+      reasoning: string
+      agent: string
+      permissionMode: PermissionMode
+      prompt: string
+      workspace: string
+      attachments: string[]
+      profileId?: string
+      sessionId?: string
+      race?: { n: number; review: boolean; autoAdopt: boolean; providers?: string[] }
+    }): Promise<{ raceId: string; winner: RaceCandidate | null; scores: Array<{ candidateId: string; score: number; provider: string }>; candidates: RaceCandidate[] }>
+    runCouncil(request: {
+      provider: ProviderId
+      permissionMode: PermissionMode
+      prompt: string
+      workspace: string
+      attachments: string[]
+      profileId?: string
+      sessionId: string
+      council: { enabled: boolean; providers?: string[] }
+    }): Promise<{ councilId: string; drafts: Array<{ provider: string; ok: boolean; summary: string; path: string | null }>; mergedPlan: string | null; openQuestions: OpenQuestion[]; readiness: 'ready' | 'needs_answers' | 'unverified'; hash: string; planPath: string }>
+    readPlan(request: { sessionId: string }): Promise<{ hash: string; path: string; content: string; raw: string } | null>
+    verifyPlanHash(request: { sessionId: string; hash: string }): Promise<boolean>
+    adoptPlan(request: { sessionId: string; planText: string; answers?: Array<{ text: string; value: string }> }): Promise<{ hash: string; path: string; readiness: 'ready' | 'needs_answers' | 'unverified' } | null>
+    getBudgetSpend(request: { sessionId: string }): Promise<{ total: number; entries: Array<Record<string, unknown>> }>
     browser: BrowserApi
     onAgentEvent(listener: (event: AgentEvent) => void): () => void
   }

@@ -261,6 +261,8 @@ export default function App() {
   const [lastRunFailed, setLastRunFailed] = useState(false)
   const [rotationNotice, setRotationNotice] = useState<{ from: string; to: string } | null>(null)
   const [typedEvents, setTypedEvents] = useState<Array<Record<string, unknown> & { type: string }>>([])
+  const [intent, setIntent] = useState<'agent' | 'plan' | 'ask'>('agent')
+  const [planResult, setPlanResult] = useState<PlanResult | null>(null)
   const messagesEnd = useRef<HTMLDivElement>(null)
   const activeRunId = useRef<string | null>(null)
   const lastExitCodeRef = useRef<number | null>(null)
@@ -402,6 +404,15 @@ export default function App() {
             }
             if (payload.type === 'agentdock.session.continuity') {
               setTypedEvents((items) => [...items, payload])
+              return
+            }
+            if (payload.type === 'agentdock.plan.result') {
+              setPlanResult({
+                readiness: payload.readiness,
+                openQuestions: payload.openQuestions || [],
+                hash: payload.hash || '',
+                planPath: payload.planPath || '',
+              })
               return
             }
           } catch {}
@@ -638,7 +649,8 @@ export default function App() {
     try {
       if (!window.agentDock) throw new Error('Agent execution is available in the Electron app.')
       setTypedEvents([])
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined })
+      setPlanResult(null)
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined, intent })
       setAttachments([])
       activeRunId.current = result.runId
       setRunId(result.runId)
@@ -795,7 +807,7 @@ export default function App() {
           <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} canRestart={view === 'chat' && !runId} canResume={view === 'chat' && !runId && Boolean(cliSessionId)} canRetry={view === 'chat' && !runId && lastRunFailed} onRestart={() => { setMoreMenuOpen(false); void restartAgent() }} onResume={() => { setMoreMenuOpen(false); void resumeSession() }} onRetry={() => { setMoreMenuOpen(false); void retryLastAction() }} />
         </div>
 
-        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null), typedEvents }} sessionTitle={sessionTitle(messages)} />}
+        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null), typedEvents, intent, setIntent, planResult }} sessionTitle={sessionTitle(messages)} />}
         {view === 'providers' && <ProvidersView installed={installed} runtime={runtime} />}
         {view === 'profiles' && <ProfilesView />}
         {view === 'mcp' && <McpView servers={mcpServers} />}
@@ -826,6 +838,8 @@ function ChatView(props: {
   profiles: CredentialProfile[]; profileId: string | null; setProfileId: (value: string | null) => void; profileMenu: boolean; setProfileMenu: (value: boolean) => void;
   rotationNotice: { from: string; to: string } | null; onDismissRotation: () => void;
   typedEvents: Array<Record<string, unknown> & { type: string }>;
+  intent: 'agent' | 'plan' | 'ask'; setIntent: (value: 'agent' | 'plan' | 'ask') => void;
+  planResult: PlanResult | null;
 }) {
   const meta = providerMeta[props.provider]
   const models = props.runtime[props.provider].models
@@ -852,6 +866,14 @@ function ChatView(props: {
       <div className="conversation-heading"><div><span className="eyebrow"><GitBranch size={12} /> WORKSPACE SESSION</span><h1>{props.sessionTitle}</h1><p>One workspace. Any coding agent.</p></div></div>
 
       {props.rotationNotice && <div className="rotation-banner"><RefreshCw size={14} /><div><strong>Profile rotated</strong><p>Quota exhausted on <code>{props.profiles.find((p) => p.id === props.rotationNotice!.from)?.name ?? props.rotationNotice!.from}</code>. Switch to <code>{props.profiles.find((p) => p.id === props.rotationNotice!.to)?.name ?? props.rotationNotice!.to}</code> for the next run.</p></div><button onClick={props.onDismissRotation}><X size={14} /></button></div>}
+
+      {props.planResult && !props.runId && <div className="plan-result-panel">
+        <div className="plan-result-head"><BrainCircuit size={16} /><strong>Plan readiness: <span className={`plan-readiness plan-readiness-${props.planResult.readiness}`}>{props.planResult.readiness.replace(/_/g, ' ')}</span></strong><span className="plan-hash">{props.planResult.hash}</span></div>
+        {props.planResult.openQuestions.length > 0 && <div className="plan-questions">
+          <div className="plan-questions-title">Open questions ({props.planResult.openQuestions.length})</div>
+          {props.planResult.openQuestions.map((q) => <div key={q.id} className="plan-question"><span className={`plan-question-kind plan-question-${q.kind}`}>{q.kind}</span><span>{q.text}</span></div>)}
+        </div>}
+      </div>}
 
       <div className="messages">
         {props.messages.map((message) => <article key={message.id} className={`message ${message.role}`}>
@@ -925,6 +947,10 @@ function ChatView(props: {
           <select aria-label="Model" value={props.model} onChange={(e) => props.chooseModel(e.target.value)} disabled={!models.length || Boolean(props.runId)}>{models.length ? models.map((item) => <option key={item.id} value={item.id}>{item.label}</option>) : <option>No models found</option>}</select>
           {selectedModel?.reasoning.length ? <select aria-label="Reasoning level" value={props.reasoning} onChange={(e) => props.setReasoning(e.target.value)} disabled={Boolean(props.runId)}>{selectedModel.reasoning.map((item) => <option key={item} value={item}>{item}</option>)}</select> : null}
           <UsageIndicator provider={props.provider} usage={{ ...props.usage, contextWindow: props.usage.contextWindow || selectedModel?.contextWindow || null }} limits={props.limits} refreshLimits={props.refreshLimits} />
+          <div className="intent-select">
+            <button className={`tool-pill intent-pill ${props.intent !== 'agent' ? 'active' : ''}`} onClick={() => props.setIntent(props.intent === 'agent' ? 'plan' : 'agent')} disabled={Boolean(props.runId)} title="Toggle plan mode (read-only, no file changes)"><BrainCircuit size={14} /> {props.intent === 'plan' ? 'Plan' : props.intent === 'ask' ? 'Ask' : 'Agent'}</button>
+            {props.intent !== 'agent' && <button className="tool-pill intent-sub" onClick={() => props.setIntent(props.intent === 'plan' ? 'ask' : 'plan')} disabled={Boolean(props.runId)} title="Switch between plan and ask">{props.intent === 'plan' ? '→ Ask' : '→ Plan'}</button>}
+          </div>
           {props.runId ? <button className="send-button stop" onClick={() => window.agentDock?.stopAgent(props.runId!)}><CircleStop size={17} /></button> : <button className="send-button" onClick={props.sendPrompt} disabled={!props.prompt.trim()}><Send size={17} /></button>}
         </div>
       </div>
@@ -1221,6 +1247,7 @@ function RunsView({ sessionId }: { sessionId: string | null }) {
               <button className={artifactPath === 'final/patch.diff' ? 'active' : ''} onClick={() => setArtifactPath('final/patch.diff')}>patch.diff</button>
               <button className={artifactPath === 'events.jsonl' ? 'active' : ''} onClick={() => setArtifactPath('events.jsonl')}>events.jsonl</button>
               <button className={artifactPath === 'final/receipt.json' ? 'active' : ''} onClick={() => setArtifactPath('final/receipt.json')}>receipt.json</button>
+              <button className={artifactPath === 'gates/result.yaml' ? 'active' : ''} onClick={() => setArtifactPath('gates/result.yaml')}>gates.yaml</button>
             </div>
             <pre className="runs-artifact-content">{artifact ?? 'No artifact found.'}</pre>
           </>
