@@ -113,6 +113,21 @@ npm run dist:linux
 
 Configured package targets are NSIS for Windows, DMG for macOS, and AppImage plus DEB for Linux. Generated artifacts are copied to `release/`.
 
+To prepare every release artifact from Windows in one command, use:
+
+```bash
+npm run release -- 0.3.0
+```
+
+This updates `package.json` and `package-lock.json`, runs the tests and frontend build, then creates the Windows x64 installer, Linux x64 AppImage and DEB, and an unsigned macOS arm64 ZIP. Linux and macOS packaging runs in WSL so Unix permissions and symlinks are preserved. WSL must provide `curl`, `tar`, and `xz`; the script downloads a matching temporary Linux Node.js runtime automatically.
+
+Omit the version to rebuild the version already in `package.json`. Use the dedicated plan command to inspect the artifact list without changing files, or the fast command when tests have already been run:
+
+```bash
+npm run release:plan -- 0.3.0
+npm run release:fast -- 0.3.0
+```
+
 ## Architecture
 
 ```text

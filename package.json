@@ -19,7 +19,10 @@
     "dist": "npm run build && node scripts/package.cjs",
     "dist:win": "npm run build && node scripts/package.cjs --win --x64",
     "dist:linux": "npm run build && node scripts/package.cjs --linux --x64",
-    "dist:mac": "npm run build && node scripts/package.cjs --mac --arm64"
+    "dist:mac": "npm run build && node scripts/package.cjs --mac --arm64",
+    "release": "node scripts/build-release.cjs",
+    "release:plan": "node scripts/build-release.cjs --plan",
+    "release:fast": "node scripts/build-release.cjs --skip-tests"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
