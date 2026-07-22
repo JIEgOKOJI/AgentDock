@@ -55,6 +55,50 @@ interface McpServerInfo {
   detail: string
 }
 
+type McpTransport = 'stdio' | 'sse' | 'http'
+
+interface ManagedMcpServer {
+  id: string
+  name: string
+  description: string
+  transport: McpTransport
+  command: string
+  args: string[]
+  url: string
+  env: Record<string, string>
+  headers: Record<string, string>
+  cwd: string
+  providers: ProviderId[]
+  scope: 'global' | 'workspace'
+  workspace: string
+  enabled: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+interface McpSyncResult {
+  results: Array<{ provider: ProviderId; path: string; backup: string | null; count: number }>
+  backupDir: string
+}
+
+interface McpImportResult {
+  added: number
+  merged: number
+  imported: ManagedMcpServer[]
+}
+
+interface McpHealthResult {
+  ok: boolean
+  detail: string
+  statusCode?: number
+}
+
+interface McpConflict {
+  name: string
+  managed: { command: string; url: string; transport: McpTransport } | null
+  cli: { command: string; url: string; transport: McpTransport; providers: ProviderId[] }
+}
+
 interface SkillInfo {
   id: string
   name: string
@@ -182,6 +226,17 @@ interface Window {
       providers: Record<ProviderId, ProviderRuntime>
     }>
     getMcpServers(): Promise<McpServerInfo[]>
+    getManagedMcpServers(workspace?: string): Promise<ManagedMcpServer[]>
+    upsertManagedMcpServer(request: Partial<ManagedMcpServer> & { name: string }): Promise<ManagedMcpServer>
+    removeManagedMcpServer(id: string): Promise<boolean>
+    toggleManagedMcpServer(request: { id: string; enabled: boolean }): Promise<ManagedMcpServer | null>
+    importManagedMcpServers(workspace?: string): Promise<McpImportResult>
+    syncManagedMcpServers(request: { providers?: ProviderId[]; workspace?: string }): Promise<McpSyncResult>
+    checkManagedMcpServer(serverInput: Partial<ManagedMcpServer>): Promise<McpHealthResult>
+    exportManagedMcpServers(ids?: string[]): Promise<{ version: number; exportedAt: number; servers: ManagedMcpServer[] }>
+    importMcpPayload(request: { payload?: { servers: ManagedMcpServer[] }; path?: string }): Promise<{ added: number; merged: number }>
+    exportMcpToFile(ids?: string[]): Promise<{ canceled: boolean; path?: string }>
+    getMcpConflicts(workspace?: string): Promise<McpConflict[]>
     listSkills(workspace: string): Promise<SkillInfo[]>
     getDefaultGlobalSkills(): Promise<string[]>
     setDefaultGlobalSkill(request: { workspace: string; id: string; enabled: boolean }): Promise<string[]>

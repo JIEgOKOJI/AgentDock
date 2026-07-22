@@ -122,3 +122,66 @@ details.final-file { display: block; padding: 0; }
 .browser-empty svg { color: #353c47; }
 .browser-empty h2 { margin: 0; color: #68717e; font-size: 14px; font-weight: 600; }
 .browser-empty p { margin: 0; color: #525a67; font-size: 11px; }
+
+.mcp-heading-actions { display: flex; gap: 8px; }
+.mcp-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.mcp-filter-group { display: flex; align-items: center; gap: 5px; }
+.mcp-filter-label { color: #515968; font: 500 9px DM Mono; letter-spacing: .08em; text-transform: uppercase; }
+.mcp-toolbar-spacer { flex: 1; }
+.mcp-toolbar-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.mcp-tool-button { height: 34px; display: flex; align-items: center; gap: 7px; border: 1px solid #2a2f38; border-radius: 7px; padding: 0 12px; background: #11151b; color: #9aa2ad; font-size: 10px; cursor: pointer; }
+.mcp-tool-button:hover { border-color: #474e5a; color: #c7cbd2; }
+.mcp-tool-button.primary { border-color: #49405f; background: #211c2c; color: #a99ad8; }
+.mcp-tool-button.primary:disabled { opacity: .55; cursor: default; }
+.primary-button:disabled { opacity: .55; cursor: default; }
+.mcp-tool-button.danger { color: #c47b87; }
+.mcp-server-list { display: flex; flex-direction: column; gap: 10px; }
+.mcp-server-row { border: 1px solid #222731; border-radius: 10px; background: #11151b; overflow: hidden; }
+.mcp-server-row.disabled { opacity: .6; }
+.mcp-server-head { display: flex; align-items: center; gap: 13px; padding: 14px 16px; }
+.mcp-server-icon { width: 34px; height: 34px; flex: 0 0 34px; display: grid; place-items: center; border-radius: 8px; background: #1a1d24; color: #6b7380; }
+.mcp-server-icon.on { background: #17231a; color: #78b987; }
+.mcp-server-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.mcp-server-info strong { font-size: 11px; }
+.mcp-server-info small { color: #606976; font: 9px DM Mono; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-server-providers { display: flex; gap: 4px; }
+.mcp-server-providers span { padding: 2px 5px; border: 1px solid #272c35; border-radius: 4px; color: #4f5662; font: 7px DM Mono; }
+.mcp-server-providers span.available { border-color: #364939; background: #17231a; color: #78b987; }
+.mcp-scope-badge { padding: 2px 6px; border: 1px solid #2e333d; border-radius: 4px; color: #6d7582; font: 8px DM Mono; }
+.mcp-health { padding: 2px 6px; border-radius: 4px; font: 8px DM Mono; }
+.mcp-health.ok { background: #17231a; color: #78b987; }
+.mcp-health.fail { background: #2a1d22; color: #b06c77; }
+.mcp-server-foot { display: flex; align-items: center; gap: 14px; padding: 10px 16px; border-top: 1px solid #20242c; }
+.mcp-transport { display: flex; align-items: center; gap: 5px; color: #6b7380; font: 9px DM Mono; }
+.mcp-server-actions { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.mcp-server-action { height: 26px; display: flex; align-items: center; gap: 5px; border: 0; border-radius: 5px; padding: 0 8px; background: transparent; color: #8f82bd; font-size: 9px; cursor: pointer; }
+.mcp-server-action:hover { background: #211c2c; color: #b6a5e8; }
+.mcp-server-action:disabled { cursor: default; opacity: .5; }
+.mcp-server-action.danger { color: #b06c77; }
+.mcp-server-action.danger:hover { background: #2a1d22; color: #d18a95; }
+.mcp-conflict-banner { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 16px; padding: 12px 16px; border: 1px solid #5b4330; border-radius: 9px; background: #1c1715; color: #d1a15f; }
+.mcp-conflict-banner svg { flex: 0 0 auto; margin-top: 1px; }
+.mcp-conflict-banner strong { font-size: 11px; }
+.mcp-conflict-banner p { margin: 4px 0 0; color: #a87f4a; font-size: 9px; line-height: 1.5; }
+.mcp-editor-overlay { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; background: #000a; backdrop-filter: blur(2px); }
+.mcp-editor { width: 560px; max-width: calc(100vw - 40px); max-height: calc(100vh - 80px); overflow-y: auto; border: 1px solid #2b303b; border-radius: 13px; background: #151921; box-shadow: 0 20px 60px #000c; }
+.mcp-editor-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid #222731; }
+.mcp-editor-head h2 { margin: 0; font-size: 14px; }
+.mcp-editor-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+.mcp-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.mcp-form-full { display: flex; flex-direction: column; gap: 5px; }
+.mcp-field-label { display: block; margin-bottom: 6px; color: #515968; font: 500 9px DM Mono; letter-spacing: .08em; text-transform: uppercase; }
+.mcp-editor label { display: flex; flex-direction: column; gap: 5px; color: #878e9a; font-size: 9px; }
+.mcp-editor input, .mcp-editor select, .mcp-editor textarea { height: 32px; border: 1px solid #252a33; border-radius: 6px; padding: 0 10px; background: #0d1015; color: #c4c9cf; font-size: 10px; outline: 0; }
+.mcp-editor textarea { height: auto; padding: 8px 10px; resize: vertical; font: 10px DM Mono; }
+.mcp-editor input:focus, .mcp-editor select:focus, .mcp-editor textarea:focus { border-color: #5b516f; }
+.mcp-provider-toggles { display: flex; gap: 7px; }
+.mcp-provider-chip { display: flex; flex-direction: row !important; align-items: center; gap: 5px; border: 1px solid #272c35; border-radius: 6px; padding: 5px 10px; color: #5f6875; font-size: 9px; cursor: pointer; }
+.mcp-provider-chip input { display: none; }
+.mcp-provider-chip.on { border-color: #364939; background: #17231a; color: #78b987; }
+.mcp-enabled-toggle { flex-direction: row !important; align-items: center; margin-top: 4px; }
+.mcp-form-hint { padding: 8px 10px; border: 1px solid #2a2f38; border-radius: 6px; background: #11151b; color: #676f7b; font-size: 9px; line-height: 1.5; }
+.mcp-form-hint code { font: 9px DM Mono; color: #9d88f2; }
+.mcp-editor-foot { display: flex; justify-content: flex-end; gap: 9px; padding: 14px 20px; border-top: 1px solid #222731; }
+.skill-actions .danger, .skill-actions .danger:hover { color: #c47b87; }
+.primary-button, .mcp-tool-button { justify-content: center; white-space: nowrap; }

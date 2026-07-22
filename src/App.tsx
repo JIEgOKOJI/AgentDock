@@ -9,9 +9,10 @@ import { parseAgentTranscript } from './agent-events.mjs'
 import { describeActivity } from './activity-format.mjs'
 import { MoreMenu, MoreMenuTrigger } from './components/MoreMenu'
 import { BrowserView } from './components/BrowserView'
+import { McpManagerView } from './components/McpManagerView'
 
 type ProviderId = 'codex' | 'claude' | 'opencode'
-type ViewId = 'chat' | 'providers' | 'mcp' | 'skills' | 'settings'
+type ViewId = 'chat' | 'providers' | 'mcp' | 'mcp-manager' | 'skills' | 'settings'
 type Message = ChatMessage
 
 const providerMeta: Record<ProviderId, { name: string; badge: string; color: string }> = {
@@ -36,6 +37,7 @@ const nav = [
   { id: 'chat' as ViewId, label: 'Workspace', icon: MessageSquareText },
   { id: 'providers' as ViewId, label: 'Providers', icon: Bot },
   { id: 'mcp' as ViewId, label: 'MCP servers', icon: PlugZap },
+  { id: 'mcp-manager' as ViewId, label: 'MCP manager', icon: Wrench },
   { id: 'skills' as ViewId, label: 'Skills', icon: Blocks },
 ]
 
@@ -729,6 +731,7 @@ export default function App() {
         {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits }} sessionTitle={sessionTitle(messages)} />}
         {view === 'providers' && <ProvidersView installed={installed} runtime={runtime} />}
         {view === 'mcp' && <McpView servers={mcpServers} />}
+        {view === 'mcp-manager' && <McpManagerView workspace={workspace} />}
         {view === 'skills' && <SkillsView workspace={workspace} />}
         {view === 'settings' && <SettingsView workspace={workspace} contextHandoff={contextHandoff} onContextHandoffChange={async (enabled) => { setContextHandoff(enabled); try { await window.agentDock?.patchSettings({ contextHandoff: enabled }) } catch {} }} />}
         <div ref={messagesEnd} />

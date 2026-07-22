@@ -11,6 +11,7 @@ const { createBrowserAutomation } = require('./browser-automation.cjs')
 const { createBrowserMcp, SERVER_NAME: BROWSER_MCP_NAME } = require('./browser-mcp.cjs')
 const { browserMcpLaunchOptions, withBrowserAwarenessPrompt } = require('./browser-mcp-config.cjs')
 const { normalizeBounds } = require('./browser-url.cjs')
+const mcp = require('./mcp-manager.cjs')
 
 const running = new Map()
 const SESSION_STORE_VERSION = 1
@@ -496,6 +497,65 @@ function createWindow() {
 ipcMain.handle('system:info', loadSystemInfo)
 
 ipcMain.handle('mcp:list', loadMcpServers)
+
+ipcMain.handle('mcp:managed-list', (_event, request = {}) => mcp.listServers(app.getPath('userData'), request.workspace))
+
+ipcMain.handle('mcp:managed-upsert', (_event, request = {}) => mcp.upsertServer(app.getPath('userData'), request))
+
+ipcMain.handle('mcp:managed-remove', (_event, id) => mcp.removeServer(app.getPath('userData'), id))
+
+ipcMain.handle('mcp:managed-toggle', (_event, request = {}) => mcp.setServerEnabled(app.getPath('userData'), request.id, request.enabled))
+
+ipcMain.handle('mcp:managed-import', async (_event, request = {}) => {
+  const home = app.getPath('home')
+  const codexHome = getCodexHome()
+  return mcp.importIntoStore(app.getPath('userData'), home, codexHome, request.workspace)
+})
+
+ipcMain.handle('mcp:managed-sync', async (_event, request = {}) => {
+  const home = app.getPath('home')
+  const codexHome = getCodexHome()
+  return mcp.syncAll(app.getPath('userData'), home, codexHome, { providers: request.providers, workspace: request.workspace })
+})
+
+ipcMain.handle('mcp:managed-check', async (_event, serverInput) => {
+  const normalized = mcp.normalizeServer(serverInput)
+  if (!normalized) return { ok: false, detail: 'Invalid server definition' }
+  return mcp.checkServerHealth(normalized)
+})
+
+ipcMain.handle('mcp:managed-export', (_event, request = {}) => mcp.exportServers(app.getPath('userData'), request.ids))
+
+ipcMain.handle('mcp:managed-import-payload', async (_event, request = {}) => {
+  if (request.path) {
+    try {
+      const content = fs.readFileSync(request.path, 'utf8')
+      const payload = JSON.parse(content)
+      return mcp.importExport(app.getPath('userData'), payload)
+    } catch (error) {
+      throw new Error(`Could not read export file: ${error.message}`)
+    }
+  }
+  return mcp.importExport(app.getPath('userData'), request.payload)
+})
+
+ipcMain.handle('mcp:managed-export-save', async (_event, request = {}) => {
+  const payload = mcp.exportServers(app.getPath('userData'), request.ids)
+  const result = await dialog.showSaveDialog({
+    title: 'Export MCP server configurations',
+    defaultPath: 'agentdock-mcp-servers.json',
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  })
+  if (result.canceled || !result.filePath) return { canceled: true }
+  fs.writeFileSync(result.filePath, JSON.stringify(payload, null, 2), 'utf8')
+  return { canceled: false, path: result.filePath }
+})
+
+ipcMain.handle('mcp:managed-conflicts', async (_event, request = {}) => {
+  const home = app.getPath('home')
+  const codexHome = getCodexHome()
+  return mcp.detectConflicts(app.getPath('userData'), home, codexHome, request.workspace)
+})
 
 // --- Browser IPC ---
 ipcMain.handle('browser:get-state', () => browserManager.getState())
