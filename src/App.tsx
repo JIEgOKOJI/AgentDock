@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Blocks, Bot, BrainCircuit, Check, ChevronDown, ChevronRight, CircleStop,
+  BarChart3, Blocks, Bot, BrainCircuit, Check, ChevronDown, ChevronRight, CircleStop,
   Command, Folder, GitBranch, KeyRound, Menu, MessageSquareText, RefreshCw,
   PanelLeftClose, Paperclip, PlugZap, Plus, Search, Send, Settings, Sparkles,
   FileDiff, FileText, Hand, ShieldAlert, ShieldCheck, Share2, TerminalSquare, Trash2, Wrench, X, Zap,
 } from 'lucide-react'
 import { parseAgentTranscript } from './agent-events.mjs'
+import { extractTokenUsage, addTokenUsage, emptyTokenUsage, contextSnapshot, mergeUsageWithTotals, resolveLaneContext, CONTEXT_UNKNOWN, CONTEXT_ESTIMATED, CONTEXT_RUNTIME, CONTEXT_FALLBACK, CONTEXT_MODEL_META } from './token-usage.mjs'
+import { aggregateUsage, uniqueValues, UNKNOWN_MODEL, UNKNOWN_PROFILE, type NormalizedUsageRecord, type UsageStats } from './token-usage-stats.mjs'
+import { createContextItem, COMPONENT_CATEGORIES } from './context-usage.mjs'
 import { describeActivity } from './activity-format.mjs'
 import { MoreMenu, MoreMenuTrigger } from './components/MoreMenu'
 import { BrowserView } from './components/BrowserView'
@@ -16,12 +19,12 @@ import { OrchestrationControls, defaultOrchestrationConfig, loadOrchestrationPre
 import { CompareView, type RaceResultView } from './components/CompareView'
 import { ApprovalInbox } from './components/ApprovalInbox'
 import { Markdown, DiffView } from './components/Markdown'
-import { PipelinePanel, PipelineStrip, loadPipelineConfig, defaultPipelineConfig, validatePipeline, buildStepPrompt, pipelineRoleMeta, parseVerdict } from './components/PipelinePanel'
+import { PipelinePanel, PipelineStrip, loadPipelineConfig, defaultPipelineConfig, validatePipeline, buildStepPrompt, buildStepPromptParts, pipelineRoleMeta, parseVerdict } from './components/PipelinePanel'
 import { RunTree } from './components/RunTree'
 import { ArtifactsPanel } from './components/ArtifactsPanel'
 
 type ProviderId = 'codex' | 'claude' | 'opencode'
-type ViewId = 'chat' | 'providers' | 'profiles' | 'mcp-manager' | 'skills' | 'runs' | 'settings'
+type ViewId = 'chat' | 'providers' | 'profiles' | 'mcp-manager' | 'skills' | 'runs' | 'usage' | 'settings'
 type Message = ChatMessage
 
 const providerMeta: Record<ProviderId, { name: string; badge: string; color: string }> = {
@@ -37,8 +40,8 @@ const permissionMeta: Record<PermissionMode, { label: string; description: strin
 }
 
 const fallbackRuntime: Record<ProviderId, ProviderRuntime> = {
-  codex: { installed: false, path: null, version: null, agents: ['default'], models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', reasoning: ['low', 'medium', 'high'], defaultReasoning: 'low' }] },
-  claude: { installed: false, path: null, version: null, agents: ['default'], models: [{ id: 'sonnet', label: 'Sonnet (latest)', reasoning: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoning: 'high' }] },
+  codex: { installed: false, path: null, version: null, agents: ['default'], models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', contextWindow: 400000, contextWindowSource: 'fallback', reasoning: ['low', 'medium', 'high'], defaultReasoning: 'low' }] },
+  claude: { installed: false, path: null, version: null, agents: ['default'], models: [{ id: 'sonnet', label: 'Sonnet (latest)', contextWindow: 200000, contextWindowSource: 'fallback', reasoning: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoning: 'high' }] },
   opencode: { installed: false, path: null, version: null, agents: ['default'], models: [] },
 }
 
@@ -49,6 +52,7 @@ const nav = [
   { id: 'mcp-manager' as ViewId, label: 'MCP servers', icon: PlugZap },
   { id: 'skills' as ViewId, label: 'Skills', icon: Blocks },
   { id: 'runs' as ViewId, label: 'Run artifacts', icon: FileDiff },
+  { id: 'usage' as ViewId, label: 'Token usage', icon: BarChart3 },
 ]
 
 const starterMessages: Message[] = [{
@@ -74,96 +78,6 @@ function relativeTime(timestamp: number) {
   if (hours < 24) return `${hours}h ago`
   const days = Math.floor(hours / 24)
   return days === 1 ? 'yesterday' : `${days}d ago`
-}
-
-const emptyTokenUsage = (): TokenUsage => ({
-  inputTokens: 0,
-  cachedInputTokens: 0,
-  outputTokens: 0,
-  reasoningTokens: 0,
-  totalTokens: 0,
-  contextTokens: 0,
-  contextWindow: null,
-})
-
-function extractTokenUsage(provider: ProviderId, raw: string, modelContextWindow?: number): TokenUsage | null {
-  let usage: TokenUsage | null = null
-  const openCodeSteps: TokenUsage[] = []
-  const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
-
-  for (const line of raw.split(/\r?\n/).filter(Boolean)) {
-    try {
-      const event = JSON.parse(line)
-      if (provider === 'codex' && event.type === 'turn.completed' && event.usage) {
-        const inputTokens = number(event.usage.input_tokens)
-        const outputTokens = number(event.usage.output_tokens)
-        usage = {
-          inputTokens,
-          cachedInputTokens: number(event.usage.cached_input_tokens),
-          outputTokens,
-          reasoningTokens: number(event.usage.reasoning_output_tokens),
-          totalTokens: inputTokens + outputTokens,
-          contextTokens: inputTokens + outputTokens,
-          contextWindow: modelContextWindow || null,
-        }
-      } else if (provider === 'claude' && event.type === 'result' && event.usage) {
-        const inputTokens = number(event.usage.input_tokens)
-        const cachedInputTokens = number(event.usage.cache_read_input_tokens) + number(event.usage.cache_creation_input_tokens)
-        const outputTokens = number(event.usage.output_tokens)
-        const modelUsage = event.modelUsage && typeof event.modelUsage === 'object' ? Object.values(event.modelUsage)[0] as Record<string, unknown> | undefined : undefined
-        usage = {
-          inputTokens,
-          cachedInputTokens,
-          outputTokens,
-          reasoningTokens: 0,
-          totalTokens: inputTokens + cachedInputTokens + outputTokens,
-          contextTokens: inputTokens + cachedInputTokens + outputTokens,
-          contextWindow: number(modelUsage?.contextWindow) || modelContextWindow || null,
-        }
-      } else if (provider === 'opencode' && (event.type === 'step_finish' || event.type === 'step-finish') && event.part?.tokens) {
-        const tokens = event.part.tokens
-        const inputTokens = number(tokens.input)
-        const cachedInputTokens = number(tokens.cache?.read) + number(tokens.cache?.write)
-        const outputTokens = number(tokens.output)
-        const reasoningTokens = number(tokens.reasoning)
-        openCodeSteps.push({
-          inputTokens,
-          cachedInputTokens,
-          outputTokens,
-          reasoningTokens,
-          totalTokens: inputTokens + outputTokens + reasoningTokens,
-          contextTokens: inputTokens + outputTokens,
-          contextWindow: modelContextWindow || null,
-        })
-      }
-    } catch {}
-  }
-
-  if (openCodeSteps.length) {
-    const last = openCodeSteps[openCodeSteps.length - 1]
-    usage = openCodeSteps.reduce((total, step) => ({
-      inputTokens: total.inputTokens + step.inputTokens,
-      cachedInputTokens: total.cachedInputTokens + step.cachedInputTokens,
-      outputTokens: total.outputTokens + step.outputTokens,
-      reasoningTokens: total.reasoningTokens + step.reasoningTokens,
-      totalTokens: total.totalTokens + step.totalTokens,
-      contextTokens: last.contextTokens,
-      contextWindow: last.contextWindow,
-    }), emptyTokenUsage())
-  }
-  return usage
-}
-
-function addTokenUsage(total: TokenUsage, turn: TokenUsage): TokenUsage {
-  return {
-    inputTokens: total.inputTokens + turn.inputTokens,
-    cachedInputTokens: total.cachedInputTokens + turn.cachedInputTokens,
-    outputTokens: total.outputTokens + turn.outputTokens,
-    reasoningTokens: total.reasoningTokens + turn.reasoningTokens,
-    totalTokens: total.totalTokens + turn.totalTokens,
-    contextTokens: turn.contextTokens,
-    contextWindow: turn.contextWindow || total.contextWindow,
-  }
 }
 
 function sanitizeDiagnostics(raw: string) {
@@ -262,6 +176,8 @@ export default function App() {
   const sessionSearchRef = useRef<HTMLInputElement>(null)
   const [usage, setUsage] = useState<TokenUsage>(emptyTokenUsage)
   const [limits, setLimits] = useState<ProviderLimits | null | undefined>(undefined)
+  const [sessionContext, setSessionContext] = useState<SessionContextSummary | null>(null)
+  const [contextRefreshToken, setContextRefreshToken] = useState(0)
   const [contextHandoff, setContextHandoff] = useState(true)
   const [limitAction, setLimitAction] = useState<'fail' | 'ask' | 'rotate'>('fail')
   const [cliSessionId, setCliSessionId] = useState<string | null>(null)
@@ -316,7 +232,6 @@ export default function App() {
     setBranchMenu(false)
     setNewBranch('')
     setBranchError('')
-    setUsage(session.usage ?? emptyTokenUsage())
     setLimits(undefined)
     const lanes = session.lanes ?? {}
     const laneKey = `${availableProvider}:${session.profileId ?? ''}`
@@ -326,6 +241,16 @@ export default function App() {
     setLastExitCode(lane.lastExitCode ?? null)
     setLastRunFailed(lane.lastRunFailed || false)
     setProfileId(session.profileId ?? null)
+    // Session totals come from session.usage (the whole session); the live
+    // context comes from the restored lane's snapshot. This keeps totals from
+    // being rolled back to whatever the lane stored when it was last used
+    // (req #1) and keeps the live context unknown — not the session sum — for
+    // legacy sessions without per-lane usage (req #7).
+    const merged = mergeUsageWithTotals(
+      session.usage ?? undefined,
+      lane.usage ?? undefined,
+    )
+    setUsage(merged ?? emptyTokenUsage())
     lastLaneRef.current = `${availableProvider}:${session.profileId ?? ''}`
     setView('chat')
   }
@@ -403,8 +328,15 @@ export default function App() {
   useEffect(() => {
     const availableModels = runtime[provider].models
     if (!availableModels.length || availableModels.some((item) => item.id === model)) return
-    setModel(availableModels[0].id)
-    setReasoning(availableModels[0].defaultReasoning ?? availableModels[0].reasoning[0] ?? '')
+    const replacement = availableModels[0]
+    setModel(replacement.id)
+    setReasoning(replacement.defaultReasoning ?? replacement.reasoning[0] ?? '')
+    // The previously selected model is gone from the catalog; its window fill
+    // no longer applies. Invalidate the live context the same way chooseModel
+    // does (switchingModel=true) so the old model's context is not shown after
+    // auto-replacement (req #4).
+    applyLaneContext(provider, profileId, replacement.id, availableModels, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, provider, runtime])
 
   useEffect(() => {
@@ -462,8 +394,8 @@ export default function App() {
       const transcript = parseAgentTranscript(provider, rawOutput)
       const content = transcript.content || 'The agent finished without a text response.'
       const selectedModel = runtime[provider].models.find((item) => item.id === model)
-      const turnUsage = extractTokenUsage(provider, rawOutput, selectedModel?.contextWindow)
-      if (turnUsage) setUsage((total) => addTokenUsage(total, turnUsage))
+      const turnUsage = extractTokenUsage(provider, rawOutput, { model, modelContextWindow: selectedModel?.contextWindow })
+      if (turnUsage) setUsage((total) => addTokenUsage(total, turnUsage as TokenUsage))
       if (transcript.cliSessionId) setCliSessionId(transcript.cliSessionId)
       const exitCode = lastExitCodeRef.current
       setLastExitCode(exitCode)
@@ -477,6 +409,7 @@ export default function App() {
       if (activeSessionId && window.agentDock?.saveCheckpoint && content) {
         window.agentDock.saveCheckpoint({ sessionId: activeSessionId, provider, profileId: profileId ?? '', content: content.slice(0, 4000) }).catch(() => {})
       }
+      setContextRefreshToken((value) => value + 1)
     }
   }, [runId, rawOutput, provider, model, runtime])
 
@@ -513,6 +446,9 @@ export default function App() {
             lastPrompt: lastPrompt || '',
             lastExitCode: lastExitCode ?? null,
             lastRunFailed: lastRunFailed || false,
+            // Persist the lane's own context so restoring this lane later
+            // recovers its live window fill instead of the session sum.
+            usage,
           },
         },
         profileId: profileId ?? undefined,
@@ -523,6 +459,27 @@ export default function App() {
     }, 350)
     return () => window.clearTimeout(timer)
   }, [agent, activeSessionId, attachments, gitInfo, messages, model, permissionMode, provider, reasoning, sessionsReady, usage, workspace, cliSessionId, lastPrompt, lastExitCode, lastRunFailed, profileId])
+
+  useEffect(() => {
+    if (!activeSessionId || !window.agentDock) return
+    let cancelled = false
+    window.agentDock.getSessionContextSummary(activeSessionId).then((summary) => {
+      if (!cancelled) setSessionContext(summary)
+    }).catch(() => {
+      if (!cancelled) {
+        const session = sessions.find((s) => s.id === activeSessionId)
+        setSessionContext({
+          components: [],
+          byCategory: {},
+          accumulatedUsage: emptyTokenUsage(),
+          invocationCount: 0,
+          originalMessages: [],
+          unknownExplanation: 'No model calls have been made in this session yet.',
+        })
+      }
+    })
+    return () => { cancelled = true }
+  }, [activeSessionId, contextRefreshToken, sessions])
 
   useEffect(() => {
     if (view === 'chat') void refreshGitInfo()
@@ -560,10 +517,37 @@ export default function App() {
     setModel(firstModel?.id ?? '')
     setReasoning(firstModel?.defaultReasoning ?? '')
     setAgent('default')
-    setUsage((current) => ({ ...current, contextTokens: 0, contextWindow: null }))
     setLimits(undefined)
     setProviderMenu(false)
-    if (profileId && !profiles.some((profile) => profile.id === profileId && profile.provider === id)) setProfileId(null)
+    // Compute the final profile first: the previous profile may not belong to
+    // the new provider, in which case we fall back to null. Apply the matching
+    // lane's context in a single transition so the new provider's default lane
+    // is restored (not the old provider/profile's), and stale fill never leaks
+    // across the switch (req #5). Totals stay sourced from session.usage.
+    const nextProfile = profileId && profiles.some((profile) => profile.id === profileId && profile.provider === id) ? profileId : null
+    if (nextProfile !== profileId) setProfileId(nextProfile)
+    applyLaneContext(id, nextProfile, firstModel?.id ?? '', runtime[id].models)
+  }
+
+  // Unified restore/invalidation of the live context for the active lane. When
+  // the session has a persisted lane with a context snapshot, restore it so
+  // returning to A→B→A shows A's last window fill (req #5). When there is no
+  // lane yet, mark the context unknown — never carry the previous lane's fill.
+  // Session totals are untouched: they come from session.usage on restore and
+  // stay in the global `usage` totals fields otherwise (req #1).
+  const applyLaneContext = (laneProvider: ProviderId, laneProfileId: string | null, laneModel: string, availableModels: { id: string; contextWindow?: number | null; contextWindowSource?: string }[], switchingModel = false) => {
+    const session = sessions.find((item) => item.id === activeSessionId)
+    const resolved = resolveLaneContext({
+      lanes: session?.lanes ?? {},
+      provider: laneProvider,
+      profileId: laneProfileId,
+      model: laneModel,
+      availableModels,
+      currentUsage: usage,
+      switchingModel,
+    })
+    setUsage(resolved)
+    lastLaneRef.current = `${laneProvider}:${laneProfileId ?? ''}`
   }
 
   const refreshLimits = async () => {
@@ -581,17 +565,47 @@ export default function App() {
     }
   }
 
+  // Switching credential profile invalidates the previous account's plan
+  // limits; the [provider, profileId] effect re-fetches them. The previous
+  // profile's numbers must never linger during loading or after an error
+  // (req #6). The live context is restored from the matching lane when known,
+  // or invalidated to unknown so the previous account's window fill does not
+  // show until the next turn (req #2).
+  const chooseProfile = (id: string | null) => {
+    if (id === profileId) return
+    limitsRequestId.current += 1
+    setProfileId(id)
+    setLimits(null)
+    applyLaneContext(provider, id, model, runtime[provider].models)
+    setProfileMenu(false)
+  }
+
   const chooseModel = (id: string) => {
     setModel(id)
     const selected = runtime[provider].models.find((item) => item.id === id)
     setReasoning(selected?.defaultReasoning ?? selected?.reasoning[0] ?? '')
-    setUsage((current) => ({ ...current, contextTokens: 0, contextWindow: null }))
+    // Lanes are keyed by provider+profile, not by model, so a lane's context
+    // snapshot belongs to whichever model last ran in it. Switching models
+    // invalidates the live context fill: the new model's window may differ and
+    // the old model's fill does not apply (req #5). Always set contextTokens
+    // to unknown here — the next turn repopulates it from the runtime event.
+    applyLaneContext(provider, profileId, id, runtime[provider].models, true)
   }
 
   const chooseAttachments = async () => {
     const selected = await window.agentDock?.chooseAttachments()
     if (selected?.length) setAttachments((current) => [...new Set([...current, ...selected])])
   }
+
+  // Invalidate and re-fetch plan limits whenever the active provider/profile
+  // changes (including profile rotation), so stale previous-account limits
+  // never linger (req #6). `limitsRequestId` drops responses from superseded
+  // requests — the same guard used by `refreshLimits`.
+  useEffect(() => {
+    if (!sessionsReady) return
+    void refreshLimits()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, profileId, installed, sessionsReady])
 
   const chooseWorkspaceAttachments = async () => {
     const selected = await window.agentDock?.chooseWorkspaceAttachments()
@@ -670,18 +684,49 @@ export default function App() {
     window.setTimeout(() => sessionSearchRef.current?.focus(), 60)
   }
 
-  const buildLightContextPrefix = (value: string) => {
+  const buildLightContextPrefix = (value: string): { text: string; components: ReturnType<typeof createContextItem>[] } => {
     const conversationMessages = messages.filter((message) => message.id !== 'hello' && !message.pending)
     const portableContext = contextHandoff
       ? buildHandoffContext(conversationMessages)
       : conversationMessages.slice(-8).map((message) => `${message.role === 'user' ? 'User' : providerMeta[message.provider ?? provider].name}: ${message.content}`).join('\n\n')
+    const components: ReturnType<typeof createContextItem>[] = []
     const blocks: string[] = []
-    if (portableContext) blocks.push(contextHandoff
-      ? `<agentdock_session_summary>\nThis is a compact summary of the session so far, produced so the new model/provider can continue effectively:\n\n${portableContext}\n</agentdock_session_summary>`
-      : `Continue from this provider-neutral conversation context:\n\n${portableContext}`)
-    if (gitInfo?.currentBranch) blocks.push(`Active git branch: ${gitInfo.currentBranch}`)
-    if (attachments.length) blocks.push(`Attached files:\n${attachments.map((file) => `- ${file}`).join('\n')}`)
-    return blocks.length ? `<agentdock_context>\n${blocks.join('\n\n')}\n</agentdock_context>\n\n<user_request>\n${value}\n</user_request>` : value
+    if (portableContext) {
+      blocks.push(contextHandoff
+        ? `<agentdock_session_summary>\nThis is a compact summary of the session so far, produced so the new model/provider can continue effectively:\n\n${portableContext}\n</agentdock_session_summary>`
+        : `Continue from this provider-neutral conversation context:\n\n${portableContext}`)
+      components.push(createContextItem({
+        category: COMPONENT_CATEGORIES.portableContext,
+        source: contextHandoff ? 'handoff-summary' : 'last-8-messages',
+        text: portableContext,
+      }))
+    }
+    if (gitInfo?.currentBranch) {
+      blocks.push(`Active git branch: ${gitInfo.currentBranch}`)
+      components.push(createContextItem({
+        category: COMPONENT_CATEGORIES.gitBranch,
+        source: 'workspace-git',
+        text: `Active git branch: ${gitInfo.currentBranch}`,
+      }))
+    }
+    if (attachments.length) {
+      const attachmentText = `Attached files:\n${attachments.map((file) => `- ${file}`).join('\n')}`
+      blocks.push(attachmentText)
+      for (const file of attachments) {
+        components.push(createContextItem({
+          category: COMPONENT_CATEGORIES.attachment,
+          source: 'user-attachment',
+          text: file,
+        }))
+      }
+    }
+    const text = blocks.length ? `<agentdock_context>\n${blocks.join('\n\n')}\n</agentdock_context>\n\n<user_request>\n${value}\n</user_request>` : value
+    components.push(createContextItem({
+      category: COMPONENT_CATEGORIES.userRequest,
+      source: 'user-input',
+      text: value,
+    }))
+    return { text, components }
   }
 
   const runRaceFlow = async () => {
@@ -692,7 +737,7 @@ export default function App() {
     setRaceBusy(true)
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }])
     try {
-      const contextPrefix = buildLightContextPrefix(value)
+      const { text: contextPrefix, components: contextComponents } = buildLightContextPrefix(value)
       const gates = buildGatesRequest(orchestration)
       const result = await window.agentDock.runRace({
         provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments,
@@ -703,6 +748,7 @@ export default function App() {
           providers: orchestration.race.providers.length ? orchestration.race.providers : undefined,
           reviewers: orchestration.race.reviewers, minScore: orchestration.race.minScore,
         },
+        contextComponents,
       })
       setRaceResult(result)
       setAttachments([])
@@ -721,11 +767,12 @@ export default function App() {
     setCouncilBusy(true)
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }])
     try {
-      const contextPrefix = buildLightContextPrefix(value)
+      const { text: contextPrefix, components: contextComponents } = buildLightContextPrefix(value)
       const result = await window.agentDock.runCouncil({
         provider, permissionMode, prompt: contextPrefix, workspace, attachments,
         profileId: profileId ?? undefined, sessionId: activeSessionId,
         council: { enabled: true, providers: orchestration.council.providers.length ? orchestration.council.providers : undefined },
+        contextComponents,
       })
       setAttachments([])
       setPlanRefreshToken((value) => value + 1)
@@ -755,12 +802,36 @@ export default function App() {
         .map((message) => `${message.role === 'user' ? 'User' : providerMeta[message.provider ?? provider].name}: ${message.content}`)
         .join('\n\n')
     }
+    const contextComponents: ReturnType<typeof createContextItem>[] = []
     const contextBlocks: string[] = []
-    if (portableContext) contextBlocks.push(contextHandoff
-      ? `<agentdock_session_summary>\nThis is a compact summary of the session so far, produced so the new model/provider can continue effectively:\n\n${portableContext}\n</agentdock_session_summary>`
-      : `Continue from this provider-neutral conversation context:\n\n${portableContext}`)
-    if (gitInfo?.currentBranch) contextBlocks.push(`Active git branch: ${gitInfo.currentBranch}`)
-    if (attachments.length) contextBlocks.push(`Attached files:\n${attachments.map((file) => `- ${file}`).join('\n')}`)
+    if (portableContext) {
+      contextBlocks.push(contextHandoff
+        ? `<agentdock_session_summary>\nThis is a compact summary of the session so far, produced so the new model/provider can continue effectively:\n\n${portableContext}\n</agentdock_session_summary>`
+        : `Continue from this provider-neutral conversation context:\n\n${portableContext}`)
+      contextComponents.push(createContextItem({
+        category: COMPONENT_CATEGORIES.portableContext,
+        source: contextHandoff ? 'handoff-summary' : 'last-8-messages',
+        text: portableContext,
+      }))
+    }
+    if (gitInfo?.currentBranch) {
+      contextBlocks.push(`Active git branch: ${gitInfo.currentBranch}`)
+      contextComponents.push(createContextItem({
+        category: COMPONENT_CATEGORIES.gitBranch,
+        source: 'workspace-git',
+        text: `Active git branch: ${gitInfo.currentBranch}`,
+      }))
+    }
+    if (attachments.length) {
+      contextBlocks.push(`Attached files:\n${attachments.map((file) => `- ${file}`).join('\n')}`)
+      for (const file of attachments) {
+        contextComponents.push(createContextItem({
+          category: COMPONENT_CATEGORIES.attachment,
+          source: 'user-attachment',
+          text: file,
+        }))
+      }
+    }
     const currentLane = `${provider}:${profileId ?? ''}`
     const previousLane = lastLaneRef.current
     if (activeSessionId && previousLane && previousLane !== currentLane && conversationMessages.length && window.agentDock?.prepareContinuity) {
@@ -776,6 +847,11 @@ export default function App() {
         })
         if (continuity) {
           contextBlocks.push(`<agentdock_continuation>\nA continuation packet was written to disk. Read this file for the full thread history and delta from the previous lane:\n${continuity.packetPath}\n</agentdock_continuation>`)
+          contextComponents.push(createContextItem({
+            category: COMPONENT_CATEGORIES.continuationPacket,
+            source: 'lane-continuity',
+            text: continuity.packetPath,
+          }))
           setTypedEvents((items) => [...items, continuity.event])
         }
       } catch {}
@@ -783,12 +859,17 @@ export default function App() {
     const contextPrefix = contextBlocks.length
       ? `<agentdock_context>\n${contextBlocks.join('\n\n')}\n</agentdock_context>\n\n<user_request>\n${value}\n</user_request>`
       : value
-      setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }, { id: pendingId, role: 'assistant', provider, at: Date.now(), content: '', pending: true }])
+    contextComponents.push(createContextItem({
+      category: COMPONENT_CATEGORIES.userRequest,
+      source: 'user-input',
+      text: value,
+    }))
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: 'user', at: Date.now(), content: value }, { id: pendingId, role: 'assistant', provider, at: Date.now(), content: '', pending: true }])
     try {
       if (!window.agentDock) throw new Error('Agent execution is available in the Electron app.')
       setTypedEvents([])
       setPlanResult(null)
-      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined, intent: effectiveIntent, ...buildRunRequestExtras({ ...orchestration, intent: effectiveIntent }) })
+      const result = await window.agentDock.runAgent({ provider, model, reasoning, agent, permissionMode, prompt: contextPrefix, workspace, attachments, profileId: profileId ?? undefined, sessionId: activeSessionId ?? undefined, intent: effectiveIntent, contextComponents, ...buildRunRequestExtras({ ...orchestration, intent: effectiveIntent }) })
       setAttachments([])
       activeRunId.current = result.runId
       setRunId(result.runId)
@@ -807,7 +888,8 @@ export default function App() {
     const fixNotes = runState.fixRounds > 0 && step.role === 'implement'
       ? [...runState.outputs].reverse().find((output) => output.role === 'verify' && output.verdict === 'fail')?.content ?? ''
       : ''
-    const fullPrompt = buildStepPrompt(step, runState.request, runState.outputs, fixNotes, pipelineTemplatesRef.current)
+    const stepPromptParts = buildStepPromptParts(step, runState.request, runState.outputs, fixNotes, pipelineTemplatesRef.current)
+    const fullPrompt = stepPromptParts.prompt
     const label = `⛓ Step ${index + 1}/${config.steps.length} · ${pipelineRoleMeta[step.role].label} — ${providerMeta[step.provider].name} (${step.model})${fixNotes ? ' · fix round' : ''}`
     // Align global selection with the step so transcript parsing, usage, and lane bookkeeping stay consistent.
     setProvider(step.provider)
@@ -823,6 +905,8 @@ export default function App() {
         provider: step.provider, model: step.model, reasoning: step.reasoning, agent: 'default', permissionMode,
         prompt: fullPrompt, workspace, attachments, profileId: stepProfileId,
         sessionId: activeSessionId ?? undefined, intent: pipelineRoleMeta[step.role].intent,
+        pipelineStep: { role: step.role, index },
+        contextComponents: stepPromptParts.components,
       })
       activeRunId.current = result.runId
       setRunId(result.runId)
@@ -1064,7 +1148,7 @@ export default function App() {
           <MoreMenu open={moreMenuOpen} onClose={() => setMoreMenuOpen(false)} browserOpen={browserVisible} onOpenBrowser={() => { setBrowserVisible(true); void window.agentDock?.browser.show() }} canRestart={view === 'chat' && !runId} canResume={view === 'chat' && !runId && Boolean(cliSessionId)} canRetry={view === 'chat' && !runId && lastRunFailed} onRestart={() => { setMoreMenuOpen(false); void restartAgent() }} onResume={() => { setMoreMenuOpen(false); void resumeSession() }} onRetry={() => { setMoreMenuOpen(false); void retryLastAction() }} />
         </div>
 
-        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, setProfileId, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null), typedEvents, intent, setIntent, planResult }} sessionTitle={sessionTitle(messages)}
+        {view === 'chat' && <ChatView {...{ messages, rawOutput, prompt, setPrompt, sendPrompt, runId, provider, model, chooseModel, reasoning, setReasoning, agent, setAgent, agentMenu, setAgentMenu, permissionMode, setPermissionMode, permissionMenu, setPermissionMenu, providerMenu, setProviderMenu, chooseProvider, installed, runtime, attachments, setAttachments, chooseAttachments, chooseWorkspaceAttachments, gitInfo, refreshGitInfo, branchMenu, setBranchMenu, newBranch, setNewBranch, branchError, setBranchError, selectBranch, addBranch, usage, limits, refreshLimits, profiles, profileId, chooseProfile, profileMenu, setProfileMenu, rotationNotice, onDismissRotation: () => setRotationNotice(null), typedEvents, intent, setIntent, planResult }} sessionTitle={sessionTitle(messages)}
           sessionId={activeSessionId} workspace={workspace} orchestration={orchestration} setOrchestration={setOrchestration} onOrchestrationValidityChange={setOrchestrationValid} orchestrationValid={orchestrationValid}
           planRefreshToken={planRefreshToken} onImplementPlan={implementPlan} onRePlan={() => setIntent('plan')}
           raceResult={raceResult} raceBusy={raceBusy} councilBusy={councilBusy} onDismissRace={() => setRaceResult(null)}
@@ -1073,12 +1157,14 @@ export default function App() {
           onPipelineContinue={continuePipeline} onPipelineStop={stopPipeline}
           pipelineTemplates={pipelineTemplates} onPipelineTemplatesChange={(next) => void savePipelineTemplates(next)} pipelineTemplatesSaving={pipelineTemplatesSaving}
           onCandidateAdopted={() => { setApprovalRefreshToken((value) => value + 1); void refreshGitInfo() }}
+          sessionContext={sessionContext}
         />}
         {view === 'providers' && <ProvidersView installed={installed} runtime={runtime} />}
         {view === 'profiles' && <ProfilesView />}
         {view === 'mcp-manager' && <McpManagerView workspace={workspace} cliServers={mcpServers} onRefreshCli={refreshCliServers} />}
         {view === 'skills' && <SkillsView workspace={workspace} />}
         {view === 'runs' && <RunsView sessionId={activeSessionId} activeRunId={runId} approvalRefreshToken={approvalRefreshToken} onApprovalResolved={() => setApprovalRefreshToken((value) => value + 1)} />}
+        {view === 'usage' && <UsageView profiles={profiles} />}
         {view === 'settings' && <SettingsView workspace={workspace} contextHandoff={contextHandoff} onContextHandoffChange={async (enabled) => { setContextHandoff(enabled); try { await window.agentDock?.patchSettings({ contextHandoff: enabled }) } catch {} }} limitAction={limitAction} onLimitActionChange={async (action) => { setLimitAction(action); try { await window.agentDock?.patchSettings({ limitAction: action }) } catch {} }} />}
         <div ref={messagesEnd} />
         </main>
@@ -1100,7 +1186,8 @@ function ChatView(props: {
   newBranch: string; setNewBranch: (value: string) => void; branchError: string; setBranchError: (value: string) => void;
   selectBranch: (branch: string) => Promise<void>; addBranch: () => Promise<void>;
   usage: TokenUsage; limits: ProviderLimits | null | undefined; refreshLimits: () => void;
-  profiles: CredentialProfile[]; profileId: string | null; setProfileId: (value: string | null) => void; profileMenu: boolean; setProfileMenu: (value: boolean) => void;
+  profiles: CredentialProfile[]; profileId: string | null; chooseProfile: (value: string | null) => void; profileMenu: boolean; setProfileMenu: (value: boolean) => void;
+  sessionContext: SessionContextSummary | null;
   rotationNotice: { from: string; to: string } | null; onDismissRotation: () => void;
   typedEvents: Array<Record<string, unknown> & { type: string }>;
   intent: 'agent' | 'plan' | 'ask'; setIntent: (value: 'agent' | 'plan' | 'ask') => void;
@@ -1225,13 +1312,13 @@ function ChatView(props: {
           {providerProfiles.length > 0 && <div className="profile-select">
             <button className="tool-pill" onClick={() => props.setProfileMenu(!props.profileMenu)} disabled={Boolean(props.runId)}><KeyRound size={13} /> {activeProfile ? activeProfile.name : 'Default account'} <ChevronDown size={12} /></button>
             {props.profileMenu && <div className="profile-menu">
-              <button onClick={() => { props.setProfileId(null); props.setProfileMenu(false) }}><span className="profile-menu-dot" /><span><strong>Default account</strong><small>Uses the CLI&apos;s native {meta.name} configuration</small></span>{!props.profileId && <Check size={15} />}</button>
-              {providerProfiles.map((profile) => <button key={profile.id} onClick={() => { props.setProfileId(profile.id); props.setProfileMenu(false) }}><span className="profile-menu-dot" style={{ '--provider': meta.color } as React.CSSProperties} /><span><strong>{profile.name}</strong><small>{profile.configDir}</small></span>{profile.id === props.profileId && <Check size={15} />}</button>)}
+              <button onClick={() => props.chooseProfile(null)}><span className="profile-menu-dot" /><span><strong>Default account</strong><small>Uses the CLI&apos;s native {meta.name} configuration</small></span>{!props.profileId && <Check size={15} />}</button>
+              {providerProfiles.map((profile) => <button key={profile.id} onClick={() => props.chooseProfile(profile.id)}><span className="profile-menu-dot" style={{ '--provider': meta.color } as React.CSSProperties} /><span><strong>{profile.name}</strong><small>{profile.configDir}</small></span>{profile.id === props.profileId && <Check size={15} />}</button>)}
             </div>}
           </div>}
           <select aria-label="Model" value={props.model} onChange={(e) => props.chooseModel(e.target.value)} disabled={!models.length || Boolean(props.runId)}>{models.length ? models.map((item) => <option key={item.id} value={item.id}>{item.label}</option>) : <option>No models found</option>}</select>
           {selectedModel?.reasoning.length ? <select aria-label="Reasoning level" value={props.reasoning} onChange={(e) => props.setReasoning(e.target.value)} disabled={Boolean(props.runId)}>{selectedModel.reasoning.map((item) => <option key={item} value={item}>{item}</option>)}</select> : null}
-          <UsageIndicator provider={props.provider} usage={{ ...props.usage, contextWindow: props.usage.contextWindow || selectedModel?.contextWindow || null }} limits={props.limits} refreshLimits={props.refreshLimits} />
+          <UsageIndicator provider={props.provider} usage={{ ...props.usage, contextWindow: props.usage.contextWindow ?? selectedModel?.contextWindow ?? null, contextWindowSource: props.usage.contextWindowSource !== CONTEXT_UNKNOWN ? props.usage.contextWindowSource : (selectedModel?.contextWindowSource as ContextSource | undefined) ?? CONTEXT_UNKNOWN }} limits={props.limits} refreshLimits={props.refreshLimits} sessionContext={props.sessionContext} />
           <div className="intent-select">
             <button className={`tool-pill intent-pill ${props.intent !== 'agent' ? 'active' : ''}`} onClick={() => props.setIntent(props.intent === 'agent' ? 'plan' : 'agent')} disabled={Boolean(props.runId)} title="Toggle plan mode (read-only, no file changes)"><BrainCircuit size={14} /> {props.intent === 'plan' ? 'Plan' : props.intent === 'ask' ? 'Ask' : 'Agent'}</button>
             {props.intent !== 'agent' && <button className="tool-pill intent-sub" onClick={() => props.setIntent(props.intent === 'plan' ? 'ask' : 'plan')} disabled={Boolean(props.runId)} title="Switch between plan and ask">{props.intent === 'plan' ? '→ Ask' : '→ Plan'}</button>}
@@ -1424,10 +1511,13 @@ function windowLabel(window: RateLimitWindow) {
   return 'Usage limit'
 }
 
-function UsageIndicator({ provider, usage, limits, refreshLimits }: { provider: ProviderId; usage: TokenUsage; limits: ProviderLimits | null | undefined; refreshLimits: () => void }) {
+function UsageIndicator({ provider, usage, limits, refreshLimits, sessionContext }: { provider: ProviderId; usage: TokenUsage; limits: ProviderLimits | null | undefined; refreshLimits: () => void; sessionContext: SessionContextSummary | null }) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
-  const percent = usage.contextWindow ? Math.min(100, Math.round((usage.contextTokens / usage.contextWindow) * 100)) : 0
+  const hasContext = usage.contextTokens != null && usage.contextWindow != null && usage.contextWindow > 0
+  const percent = hasContext && usage.contextTokens != null ? Math.min(100, Math.round((usage.contextTokens / usage.contextWindow!) * 100)) : null
+  const isEstimated = usage.contextSource === 'estimated' || usage.contextSource === 'fallback' || usage.contextWindowSource === 'fallback'
+  const isUnknown = !hasContext || usage.contextSource === 'unknown' || usage.contextWindowSource === 'unknown'
   const windows = limits?.available ? (limits.windows ?? [limits.secondary, limits.primary].filter((item): item is RateLimitWindow => Boolean(item))) : []
 
   useEffect(() => {
@@ -1439,16 +1529,51 @@ function UsageIndicator({ provider, usage, limits, refreshLimits }: { provider: 
     return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', escape) }
   }, [open])
 
+  const orbDeg = percent != null ? percent * 3.6 : 0
+
+  const componentsByCategory = sessionContext?.components.reduce<Record<string, SessionContextSummary['components']>>((acc, component) => {
+    const list = acc[component.category] || []
+    list.push(component)
+    acc[component.category] = list
+    return acc
+  }, {}) ?? {}
+
   return <div className="usage-control" ref={root}>
-    <button className="usage-orb" onClick={() => { const next = !open; setOpen(next); if (next) refreshLimits() }} aria-label="Token usage and limits" aria-expanded={open} title="Token usage and limits" style={{ '--usage': `${percent * 3.6}deg` } as React.CSSProperties}><i /></button>
+    <button className={`usage-orb ${isUnknown ? 'unknown' : isEstimated ? 'estimated' : ''}`} onClick={() => { const next = !open; setOpen(next); if (next) refreshLimits() }} aria-label="Token usage and limits" aria-expanded={open} title="Token usage and limits" style={{ '--usage': `${orbDeg}deg` } as React.CSSProperties}><i /></button>
     {open && <div className="usage-popover">
       <div className="usage-section">
-        <div className="usage-heading"><span>Context window</span><strong>{usage.contextTokens ? formatTokens(usage.contextTokens) : '0'}{usage.contextWindow ? ` / ${formatTokens(usage.contextWindow)} (${percent}%)` : ' used'}</strong></div>
-        <div className={`usage-track ${usage.contextWindow ? '' : 'unknown'}`}><i style={{ width: `${percent}%` }} /></div>
-        {!usage.contextWindow && <small>The provider does not expose this model’s context maximum.</small>}
+        <div className="usage-heading"><span>Latest model context</span><strong>{hasContext && percent != null ? `${formatTokens(usage.contextTokens!)} / ${formatTokens(usage.contextWindow!)} (${percent}%)` : usage.contextTokens != null ? `${formatTokens(usage.contextTokens!)} used` : 'Unavailable'}</strong></div>
+        <div className={`usage-track ${hasContext ? (isEstimated ? 'estimated' : '') : 'unknown'}`}><i style={{ width: `${percent ?? 0}%` }} /></div>
+        {isUnknown && <small>{usage.contextWindow ? 'Current context fill is unknown for this model — the provider did not report it.' : 'The provider does not expose this model’s context maximum.'}</small>}
+        {isEstimated && !isUnknown && <small>Estimated fill based on token sums — the provider did not report the live context size.</small>}
       </div>
+      {sessionContext && <div className="usage-section context-composition-section">
+        <div className="usage-heading"><span>Session context composition</span><strong>{sessionContext.invocationCount} {sessionContext.invocationCount === 1 ? 'call' : 'calls'}</strong></div>
+        {sessionContext.legacy && <small className="context-legacy-note">{sessionContext.unknownExplanation}</small>}
+        <div className="context-composition">{Object.entries(componentsByCategory).map(([category, items]) => {
+          const total = items.reduce((sum, item) => sum + (item.tokens ?? 0), 0)
+          const hasUnknown = items.some((item) => item.status === 'unknown')
+          return <details className="context-composition-row" key={category}>
+            <summary>
+              <span className="context-category">{category.replace(/_/g, ' ')}</span>
+              <span className="context-meta">{items.length}× · {hasUnknown ? 'Unavailable' : `${formatTokens(total)} estimated`}</span>
+            </summary>
+            <div className="context-items">{items.map((item) => <div className="context-item" key={item.id}>
+              <div className="context-item-head">
+                <span className="context-source">{item.source}</span>
+                <span className="context-status" data-status={item.status}>{item.status === 'unknown' ? 'Unavailable' : item.status === 'reported' ? `${formatTokens(item.tokens ?? 0)} tokens` : `~${formatTokens(item.tokens ?? 0)} estimated`}</span>
+              </div>
+              <details className="context-preview">
+                <summary>{item.preview || '(no preview)'}{item.truncated && '…'}</summary>
+                {item.hash && <div className="context-hash">hash: {item.hash}</div>}
+              </details>
+            </div>)}</div>
+          </details>
+        })}</div>
+        {sessionContext.accumulatedUsage?.inputTokens > 0 && (sessionContext.accumulatedUsage.inputTokens - (sessionContext.components.reduce((sum, c) => sum + (c.status === 'reported' ? c.tokens ?? 0 : 0), 0)) > 0) && <small className="context-discrepancy">Provider reported more input tokens than the sum of known components; the difference is shown as provider overhead.</small>}
+      </div>}
       <div className="usage-section">
-        <div className="usage-heading"><span>Session tokens</span><strong>{formatTokens(usage.totalTokens)} total</strong></div>
+        <div className="usage-heading"><span>Accumulated token usage</span><strong>{formatTokens(usage.totalTokens)} total</strong></div>
         <div className="token-breakdown"><span><b>{formatTokens(usage.inputTokens)}</b> input</span><span><b>{formatTokens(usage.outputTokens)}</b> output</span>{usage.cachedInputTokens > 0 && <span><b>{formatTokens(usage.cachedInputTokens)}</b> cached</span>}{usage.reasoningTokens > 0 && <span><b>{formatTokens(usage.reasoningTokens)}</b> reasoning</span>}</div>
       </div>
       <div className="usage-section limits-section">
@@ -1628,6 +1753,176 @@ function SettingsView({ workspace, contextHandoff, onContextHandoffChange, limit
       </div></div>
     </div>
   </Page>
+}
+
+function UsageView({ profiles }: { profiles: CredentialProfile[] }) {
+  const [records, setRecords] = useState<NormalizedUsageRecord[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [providerFilter, setProviderFilter] = useState<string>('')
+  const [modelFilter, setModelFilter] = useState<string>('')
+  const [profileFilter, setProfileFilter] = useState<string>('')
+  const [fromDate, setFromDate] = useState<string>('')
+  const [toDate, setToDate] = useState<string>('')
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        setLoading(true)
+        setError('')
+        const data = await window.agentDock?.getTokenUsageStats()
+        if (cancelled) return
+        setRecords(data?.records || [])
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void load()
+    return () => { cancelled = true }
+  }, [])
+
+  const allProviders = useMemo(() => uniqueValues(records, 'provider'), [records])
+  const allModels = useMemo(() => uniqueValues(records, 'model'), [records])
+  const allProfileIds = useMemo(() => uniqueValues(records, 'profileId'), [records])
+
+  const stats = useMemo<UsageStats>(() => aggregateUsage(records, {
+    provider: providerFilter || undefined,
+    model: modelFilter || undefined,
+    profileId: profileFilter || undefined,
+    from: fromDate || undefined,
+    to: toDate || undefined,
+  }) as UsageStats, [records, providerFilter, modelFilter, profileFilter, fromDate, toDate])
+
+  const hasData = stats.grandTotal.runCount > 0
+
+  return <Page title="Token usage" subtitle="Accumulated token consumption by CLI provider, model, and credential profile.">
+    <div className="usage-filters">
+      <div className="usage-filter">
+        <label htmlFor="usage-provider">Provider</label>
+        <select id="usage-provider" value={providerFilter} onChange={(e) => { setProviderFilter(e.target.value); setModelFilter('') }}>
+          <option value="">All</option>
+          {allProviders.map((providerId: string) => <option key={providerId} value={providerId}>{providerMeta[providerId as ProviderId]?.name || providerId}</option>)}
+        </select>
+      </div>
+      <div className="usage-filter">
+        <label htmlFor="usage-model">Model</label>
+        <select id="usage-model" value={modelFilter} onChange={(e) => setModelFilter(e.target.value)}>
+          <option value="">All</option>
+          {allModels.map((modelId: string) => <option key={modelId} value={modelId}>{modelId}</option>)}
+        </select>
+      </div>
+      <div className="usage-filter">
+        <label htmlFor="usage-profile">Profile</label>
+        <select id="usage-profile" value={profileFilter} onChange={(e) => setProfileFilter(e.target.value)}>
+          <option value="">All</option>
+            {allProfileIds.map((profileId: string) => {
+              const profile = profiles.find((p) => p.id === profileId)
+              const label = profileId === UNKNOWN_PROFILE ? 'Unknown' : (profile?.name || `Deleted profile (${profileId})`)
+              return <option key={profileId} value={profileId}>{label}</option>
+            })}
+
+        </select>
+      </div>
+      <div className="usage-filter">
+        <label htmlFor="usage-from">From</label>
+        <input id="usage-from" type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
+      </div>
+      <div className="usage-filter">
+        <label htmlFor="usage-to">To</label>
+        <input id="usage-to" type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} />
+      </div>
+      <button className="usage-filter-reset" onClick={() => { setProviderFilter(''); setModelFilter(''); setProfileFilter(''); setFromDate(''); setToDate('') }}>Reset</button>
+    </div>
+
+    {loading && <div className="usage-empty">Loading usage data…</div>}
+    {error && <div className="usage-empty error">{error}</div>}
+    {!loading && !error && !hasData && <div className="usage-empty">No token usage history yet. Run an agent to populate this view.</div>}
+
+    {!loading && !error && hasData && <>
+      <div className="usage-summary">
+        <div className="usage-summary-card">
+          <span>Total runs</span>
+          <strong>{stats.grandTotal.runCount}</strong>
+        </div>
+        <div className="usage-summary-card">
+          <span>Input tokens</span>
+          <strong>{formatUsageValue(stats.grandTotal.inputTokens, stats.grandTotal.hasInput)}</strong>
+        </div>
+        <div className="usage-summary-card">
+          <span>Cached input</span>
+          <strong>{formatUsageValue(stats.grandTotal.cachedInputTokens, stats.grandTotal.hasCached)}</strong>
+        </div>
+        <div className="usage-summary-card">
+          <span>Output tokens</span>
+          <strong>{formatUsageValue(stats.grandTotal.outputTokens, stats.grandTotal.hasOutput)}</strong>
+        </div>
+        <div className="usage-summary-card">
+          <span>Reasoning tokens</span>
+          <strong>{formatUsageValue(stats.grandTotal.reasoningTokens, stats.grandTotal.hasReasoning)}</strong>
+        </div>
+        <div className="usage-summary-card total">
+          <span>Total tokens</span>
+          <strong>{formatUsageValue(stats.grandTotal.totalTokens, stats.grandTotal.hasTotal)}</strong>
+        </div>
+      </div>
+
+      <div className="usage-table-wrap">
+        <table className="usage-table">
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Model</th>
+              <th>Profile</th>
+              <th className="num">Runs</th>
+              <th className="num">Input</th>
+              <th className="num">Cached</th>
+              <th className="num">Output</th>
+              <th className="num">Reasoning</th>
+              <th className="num">Total</th>
+              <th className="num">Period</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stats.providers.flatMap((usageProvider) =>
+              usageProvider.models.flatMap((usageModel) =>
+                usageModel.profiles.map((usageProfile) => (
+                  <tr key={`${usageProvider.provider}:${usageModel.model}:${usageProfile.profileId}`}>
+                    <td>{providerMeta[usageProvider.provider as ProviderId]?.name || usageProvider.provider}</td>
+                    <td>{usageModel.model === UNKNOWN_MODEL ? <span className="usage-unknown">Unknown</span> : usageModel.model}</td>
+                    <td>{usageProfile.profileId === UNKNOWN_PROFILE ? <span className="usage-unknown">Unknown</span> : (profiles.find((p) => p.id === usageProfile.profileId)?.name || `Deleted profile (${usageProfile.profileId})`)}</td>
+                    <td className="num">{usageProfile.runCount}</td>
+                    <td className="num">{formatUsageValue(usageProfile.inputTokens, usageProfile.hasInput)}</td>
+                    <td className="num">{formatUsageValue(usageProfile.cachedInputTokens, usageProfile.hasCached)}</td>
+                    <td className="num">{formatUsageValue(usageProfile.outputTokens, usageProfile.hasOutput)}</td>
+                    <td className="num">{formatUsageValue(usageProfile.reasoningTokens, usageProfile.hasReasoning)}</td>
+                    <td className="num">{formatUsageValue(usageProfile.totalTokens, usageProfile.hasTotal)}</td>
+                    <td className="num">{formatPeriod(usageProfile.firstTs, usageProfile.lastTs)}</td>
+                  </tr>
+                ))
+              )
+            )}
+          </tbody>
+        </table>
+      </div>
+    </>}
+  </Page>
+}
+
+function formatUsageValue(value: number, known: boolean) {
+  if (!known) return <span className="usage-unknown">Unavailable</span>
+  return formatTokens(value)
+}
+
+function formatPeriod(firstTs: number | null, lastTs: number | null) {
+  if (firstTs == null || lastTs == null) return <span className="usage-unknown">Unknown</span>
+  const options: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric' }
+  const first = new Date(firstTs).toLocaleDateString(undefined, options)
+  const last = new Date(lastTs).toLocaleDateString(undefined, options)
+  if (first === last) return first
+  return `${first} – ${last}`
 }
 
 function Page({ title, subtitle, action, children }: { title: string; subtitle: string; action?: { label: string; onClick: () => void }; children: React.ReactNode }) {

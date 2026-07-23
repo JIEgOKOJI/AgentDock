@@ -3,11 +3,42 @@
 type ProviderId = 'codex' | 'claude' | 'opencode'
 type PermissionMode = 'ask' | 'auto' | 'full'
 
+// Provenance for a context-window value. Runtime = reported by the CLI at run
+// time; model-meta = derived from the resolved model catalog; fallback = a
+// vetted per-model default; estimated = computed from token sums (not the
+// actual window fill); unknown = no reliable source available.
+type ContextSource = 'runtime' | 'model-meta' | 'fallback' | 'estimated' | 'unknown'
+
+interface SessionContextSummary {
+  components: Array<{
+    id: string
+    category: string
+    source: string
+    runId: string | null
+    agent: string | null
+    chars: number
+    tokens: number | null
+    status: 'reported' | 'estimated' | 'unknown'
+    preview: string
+    truncated: boolean
+    hash: string | null
+  }>
+  byCategory: Record<string, { reported: number; estimated: number; unknown: number }>
+  accumulatedUsage: TokenUsage
+  invocationCount: number
+  originalMessages: string[]
+  unknownExplanation: string
+  legacy?: boolean
+  provider?: string
+  model?: string
+}
+
 interface ModelOption {
   id: string
   label: string
   description?: string
   contextWindow?: number
+  contextWindowSource?: ContextSource
   reasoning: string[]
   defaultReasoning: string
 }
@@ -18,8 +49,12 @@ interface TokenUsage {
   outputTokens: number
   reasoningTokens: number
   totalTokens: number
-  contextTokens: number
+  // null = unknown (do NOT render as 0%). A number = the most accurate fill of
+  // the live context window for the latest authoritative turn.
+  contextTokens: number | null
   contextWindow: number | null
+  contextSource: ContextSource
+  contextWindowSource: ContextSource
 }
 
 interface RateLimitWindow {
@@ -57,6 +92,7 @@ interface McpServerInfo {
 }
 
 type McpTransport = 'stdio' | 'sse' | 'http'
+
 
 interface ManagedMcpServer {
   id: string
@@ -153,6 +189,7 @@ interface LaneState {
   lastPrompt: string
   lastExitCode: number | null
   lastRunFailed: boolean
+  usage?: TokenUsage
 }
 
 interface RunReceipt {
@@ -178,6 +215,7 @@ interface RunReceipt {
   startedAt: number
   finishedAt: number
 }
+
 
 interface ChatSession {
   id: string
@@ -465,6 +503,8 @@ interface Window {
       maxUsd?: number
       isolated?: boolean
       delegate?: { maxSubRuns?: number; maxBestOfN?: number } | false
+      contextComponents?: Array<{ category: string; source: string; text: string; status?: 'reported' | 'estimated' | 'unknown'; tokens?: number | null; id?: string; hash?: string | null; preview?: string; truncated?: boolean; runId?: string | null; agent?: string | null; chars?: number }> | Array<ContextItem>
+      pipelineStep?: { role: string; index: number }
     }): Promise<{ runId: string; blocked?: boolean; reason?: string }>
     stopAgent(runId: string): Promise<boolean>
     runRace(request: {
@@ -480,6 +520,7 @@ interface Window {
       sessionId?: string
       gates?: { testCommand: string[] | null; protectedPaths: string[] }
       race?: { n: number; review: boolean; autoAdopt: boolean; providers?: string[]; reviewers?: number; minScore?: number }
+      contextComponents?: Array<{ category: string; source: string; text: string; status?: 'reported' | 'estimated' | 'unknown'; tokens?: number | null; id?: string; hash?: string | null; preview?: string; truncated?: boolean; runId?: string | null; agent?: string | null; chars?: number }> | Array<ContextItem>
     }): Promise<{ raceId: string; winner: RaceCandidate | null; scores: Array<{ candidateId: string; score: number; provider: string }>; candidates: RaceCandidate[]; reason?: string }>
     runCouncil(request: {
       provider: ProviderId
@@ -490,11 +531,15 @@ interface Window {
       profileId?: string
       sessionId: string
       council: { enabled: boolean; providers?: string[] }
+      contextComponents?: Array<{ category: string; source: string; text: string; status?: 'reported' | 'estimated' | 'unknown'; tokens?: number | null; id?: string; hash?: string | null; preview?: string; truncated?: boolean; runId?: string | null; agent?: string | null; chars?: number }> | Array<ContextItem>
     }): Promise<{ councilId: string; drafts: CouncilDraft[]; mergedPlan: string | null; openQuestions: OpenQuestion[]; readiness: 'ready' | 'needs_answers' | 'unverified'; hash: string; planPath: string; reason?: string }>
     readPlan(request: { sessionId: string }): Promise<PlanContract | null>
     verifyPlanHash(request: { sessionId: string; hash: string }): Promise<boolean>
     adoptPlan(request: { sessionId: string; planText: string; answers?: Array<{ text: string; value: string }> }): Promise<{ hash: string; path: string; readiness: 'ready' | 'needs_answers' | 'unverified' } | null>
     getBudgetSpend(request: { sessionId: string }): Promise<{ total: number; entries: Array<Record<string, unknown>> }>
+    getTokenUsageStats(): Promise<{ records: TokenUsageRecord[]; profileLabels: Record<string, string> }>
+    getSessionContextSummary(sessionId: string): Promise<SessionContextSummary>
+    getRunContextSnapshot(runId: string): Promise<unknown | null>
     browser: BrowserApi
     onAgentEvent(listener: (event: AgentEvent) => void): () => void
   }

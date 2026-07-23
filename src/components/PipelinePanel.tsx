@@ -97,15 +97,43 @@ export function effectiveTemplate(role: PipelineRole, templates: PipelineTemplat
   return override && override.trim() ? override : pipelineRoleMeta[role].template
 }
 
-export function buildStepPrompt(step: PipelineStep, request: string, outputs: PipelineStepOutput[], fixNotes: string, templates: PipelineTemplateOverrides = {}): string {
-  const blocks: string[] = [`## Original user request\n${clip(request, 4000)}`]
+export interface PipelineStepContext {
+  components: Array<{
+    category: string
+    source: string
+    text: string
+    status?: 'reported' | 'estimated' | 'unknown'
+    tokens?: number | null
+  }>
+  prompt: string
+}
+
+function buildStepPromptParts(step: PipelineStep, request: string, outputs: PipelineStepOutput[], fixNotes: string, templates: PipelineTemplateOverrides = {}): PipelineStepContext {
+  const components: PipelineStepContext['components'] = []
+  const requestText = clip(request, 4000)
+  components.push({ category: 'step_original_request', source: 'pipeline-request', text: requestText })
+  for (const [index, output] of outputs.entries()) {
+    components.push({ category: 'step_previous_output', source: `step-${index + 1}-${output.role}`, text: clip(output.content, 7000) })
+  }
+  if (fixNotes) components.push({ category: 'step_fix_notes', source: 'verifier', text: clip(fixNotes, 5000) })
+  const systemTemplate = effectiveTemplate(step.role, templates)
+  if (systemTemplate) components.push({ category: 'step_system_instruction', source: `role-template-${step.role}`, text: systemTemplate })
+  if (step.instruction.trim()) components.push({ category: 'step_extra_instruction', source: 'per-step-override', text: step.instruction.trim() })
+  const instruction = [systemTemplate, step.instruction.trim()].filter(Boolean).join('\n\nAdditional instructions for this stage:\n')
+  const blocks: string[] = [`## Original user request\n${requestText}`]
   for (const [index, output] of outputs.entries()) {
     blocks.push(`## Stage ${index + 1} output — ${pipelineRoleMeta[output.role].label} (${providerNames[output.provider]} · ${output.model})\n${clip(output.content, 7000)}`)
   }
   if (fixNotes) blocks.push(`## Fix round — the verifier rejected the previous implementation with these notes\n${clip(fixNotes, 5000)}`)
-  const instruction = [effectiveTemplate(step.role, templates), step.instruction.trim()].filter(Boolean).join('\n\nAdditional instructions for this stage:\n')
-  return `<pipeline_context>\nYou are one stage in a multi-agent pipeline. Earlier stage outputs:\n\n${blocks.join('\n\n')}\n</pipeline_context>\n\n<stage_instruction>\n${instruction}\n</stage_instruction>`
+  const prompt = `<pipeline_context>\nYou are one stage in a multi-agent pipeline. Earlier stage outputs:\n\n${blocks.join('\n\n')}\n</pipeline_context>\n\n<stage_instruction>\n${instruction}\n</stage_instruction>`
+  return { components, prompt }
 }
+
+export function buildStepPrompt(step: PipelineStep, request: string, outputs: PipelineStepOutput[], fixNotes: string, templates: PipelineTemplateOverrides = {}): string {
+  return buildStepPromptParts(step, request, outputs, fixNotes, templates).prompt
+}
+
+export { buildStepPromptParts }
 
 export function parseVerdict(content: string): 'pass' | 'fail' | undefined {
   const match = [...content.matchAll(/VERDICT:\s*(PASS|FAIL)/gi)].at(-1)

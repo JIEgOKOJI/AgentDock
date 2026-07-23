@@ -18,18 +18,20 @@ const mcp = require('./mcp-manager.cjs')
 const { ORCHESTRATOR_VERSION, generateRunId, prepareEnvelope, executeAttempt, captureChanges, verifyGates, verifyBaseCompatible, adoptPatch, computeOutcome, cleanupEnvelope, runWithRepairLoop, workspaceChangeDelta: orchestratorDelta } = require('./run-orchestrator.cjs')
 
 const running = new Map()
+const activeContextInvocations = new Map()
 const SESSION_STORE_VERSION = 1
 const SETTINGS_STORE_VERSION = 3
 const getCodexHome = () => process.env.CODEX_HOME || path.join(app.getPath('home'), '.codex')
 const { readProfiles, writeProfiles, normalizeProfile, profileEnvOverlay, findProfile, readyProfilesForProvider, isProfileExhausted, isTypedVendorLimitSignal, isProfileReady, nextReadyProfile, nextReadyProfileByLimits, detectDefaultProfiles, mergeProfiles } = require('./profiles.cjs')
 const { ensureLaneDir, normalizeLanes, getLaneState, setLaneState, migrateLegacySession } = require('./lanes.cjs')
-const { ensureRunDir, appendEvents, writePatch, writeSummary, writePlanArtifact, writeTelemetry, writeReceipt, readReceipt, listRuns, readArtifact, readArtifactByManifest, listArtifacts, writeManifest, readManifest, verifyManifestHashes, recoverEventsJsonl, startupRecovery, buildDiffFromChanges, normalizeReceipt, workspaceFingerprint } = require('./artifacts.cjs')
+const { ensureRunDir, appendEvents, writePatch, writeSummary, writePlanArtifact, writeTelemetry, writeReceipt, readReceipt, listRuns, readArtifact, readArtifactByManifest, listArtifacts, writeManifest, readManifest, verifyManifestHashes, recoverEventsJsonl, startupRecovery, buildDiffFromChanges, normalizeReceipt, workspaceFingerprint, atomicWrite } = require('./artifacts.cjs')
 const { writeCheckpoint, readCheckpoint, writeThread, readThread, buildContinuationPacket, continuityEventPayload, laneLabel, buildThreadFromMessages, readDeliveredId, writeDeliveredId } = require('./continuity.cjs')
 const { planPrefix, parseOpenQuestions, classifyPlanReadiness, writePlanContract, readPlanContract, verifyPlanHash, contentHash, verifyPlanContentHash, normalizeOpenQuestions } = require('./plan.cjs')
 const { normalizeGatesConfig, checkProtectedPaths, runGateCommand, writeGateResult, evaluateGates } = require('./gates.cjs')
 const { normalizeRepairConfig, buildRepairPrompt, detectStall, shouldContinue, writeAttemptLog, repairEventPayload, MAX_ATTEMPTS, stallFingerprint, writeAttemptArtifact } = require('./repair.cjs')
-const { estimateRunCost, normalizeBudget, checkBudget, hasBudgetHeadroom, appendSpendEntry, sessionSpend, readSpendLedger, totalSpend, reserveBudget, releaseReservation, settleReservation, totalReserved, clearReservations, pricingSnapshot } = require('./budget.cjs')
+const { estimateRunCost, normalizeBudget, checkBudget, hasBudgetHeadroom, appendSpendEntry, sessionSpend, readSpendLedger, readAllSpendLedgers, totalSpend, reserveBudget, releaseReservation, settleReservation, totalReserved, clearReservations, pricingSnapshot } = require('./budget.cjs')
 const { createWorktree, captureWorktreeDiff, applyPatch, removeWorktree, isGitRepo, getBaseTreeHash, createNonGitEnvelope } = require('./worktree.cjs')
+const { createContextItem, createContextInvocation, reconcileInvocation, aggregateSessionSummary, buildLegacySummary, buildEmptySummary, contextSnapshot, COMPONENT_CATEGORIES } = require('./context-usage.cjs')
 const { normalizeRaceConfig, writeCandidateArtifact, normalizeCandidate, scoreCandidate, arbitrate, buildReviewPrompt, parseReviewResponse, writeArbitrationResult, writeReviewArtifact, raceEventPayload, selectProvidersForRace, selectReviewersForCandidate, ensureRaceDir, providerFamily, distinctReviewFamilies } = require('./race.cjs')
 const { normalizeCouncilConfig, writeDraft, readDraft, listDrafts, buildMergePrompt, councilEventPayload, ensureCouncilDir, contentHash: councilContentHash, mergeOpenQuestions, selectCouncilProviders } = require('./council.cjs')
 
@@ -54,19 +56,27 @@ const browserMcp = createBrowserMcp(browserManager, browserAutomation)
 let browserMcpReady = false
 let mainWindow = null
 
-function normalizeTokenUsage(value) {
-  if (!value || typeof value !== 'object') return undefined
-  const number = (field) => Number.isFinite(value[field]) ? Math.max(0, value[field]) : 0
-  const contextWindow = Number.isFinite(value.contextWindow) && value.contextWindow > 0 ? value.contextWindow : null
-  return {
-    inputTokens: number('inputTokens'),
-    cachedInputTokens: number('cachedInputTokens'),
-    outputTokens: number('outputTokens'),
-    reasoningTokens: number('reasoningTokens'),
-    totalTokens: number('totalTokens'),
-    contextTokens: number('contextTokens'),
-    contextWindow,
+function contextManifestPath(userData, runId) {
+  return path.join(runDir(userData, runId), 'context.json')
+}
+
+function writeContextManifest(userData, runId, invocation) {
+  if (!invocation) return
+  try {
+    atomicWrite(contextManifestPath(userData, runId), JSON.stringify({ version: 1, ...contextSnapshot(invocation) }, null, 2))
+  } catch {}
+}
+
+function readContextManifest(userData, runId) {
+  try {
+    return JSON.parse(fs.readFileSync(contextManifestPath(userData, runId), 'utf8'))
+  } catch {
+    return null
   }
+}
+
+function normalizeTokenUsage(value) {
+  return normalizeTokenUsageShared(value, { legacy: true })
 }
 
 function getSessionStorePath() {
@@ -159,12 +169,15 @@ function writeSessions(sessions) {
   fs.writeFileSync(storePath, JSON.stringify({ version: SESSION_STORE_VERSION, sessions }, null, 2), 'utf8')
 }
 
+const { extractTokenUsage: extractTokenUsageShared, addTokenUsage: addTokenUsageShared, normalizeTokenUsage: normalizeTokenUsageShared, emptyTokenUsage: emptyTokenUsageShared, fallbackContextWindow } = require('./token-usage.cjs')
+const { normalizeUsageRecord } = require('./token-usage-stats.cjs')
+
 const fallbackModels = {
-  codex: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', reasoning: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultReasoning: 'low' }],
+  codex: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', reasoning: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultReasoning: 'low', contextWindow: fallbackContextWindow('codex', 'gpt-5.6-sol') || undefined, contextWindowSource: 'fallback' }],
   claude: [
-    { id: 'sonnet', label: 'Sonnet (latest)', reasoning: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoning: 'high' },
-    { id: 'opus', label: 'Opus (latest)', reasoning: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoning: 'high' },
-    { id: 'haiku', label: 'Haiku (latest)', reasoning: ['low', 'medium', 'high'], defaultReasoning: 'medium' },
+    { id: 'sonnet', label: 'Sonnet (latest)', reasoning: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoning: 'high', contextWindow: fallbackContextWindow('claude', 'sonnet') || undefined, contextWindowSource: 'fallback' },
+    { id: 'opus', label: 'Opus (latest)', reasoning: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoning: 'high', contextWindow: fallbackContextWindow('claude', 'opus') || undefined, contextWindowSource: 'fallback' },
+    { id: 'haiku', label: 'Haiku (latest)', reasoning: ['low', 'medium', 'high'], defaultReasoning: 'medium', contextWindow: fallbackContextWindow('claude', 'haiku') || undefined, contextWindowSource: 'fallback' },
   ],
   opencode: [],
 }
@@ -268,13 +281,25 @@ function getCodexModels() {
             child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'model/list', params: { limit: 100, includeHidden: false } })}\n`)
           }
           if (message.id === 2 && Array.isArray(message.result?.data)) {
-            finish(message.result.data.map((item) => ({
-              id: item.model,
-              label: item.displayName || item.model,
-              description: item.description || '',
-              reasoning: item.supportedReasoningEfforts?.map((effort) => effort.reasoningEffort) || [],
-              defaultReasoning: item.defaultReasoningEffort || '',
-            })))
+            finish(message.result.data.map((item) => {
+              // Prefer context limit from model/list metadata when exposed; fall
+              // back to the vetted per-model table otherwise. Source is tracked
+              // so the runtime event can still supersede this at display time.
+              const metaWindow = Number(item.contextWindow ?? item.context_window ?? item.maxContextTokens ?? item.max_context_tokens)
+              const hasMeta = Number.isFinite(metaWindow) && metaWindow > 0
+              const fallback = fallbackContextWindow('codex', item.model)
+              const contextWindow = hasMeta ? metaWindow : (fallback || undefined)
+              const contextWindowSource = hasMeta ? 'model-meta' : (fallback ? 'fallback' : 'unknown')
+              return {
+                id: item.model,
+                label: item.displayName || item.model,
+                description: item.description || '',
+                contextWindow,
+                contextWindowSource,
+                reasoning: item.supportedReasoningEfforts?.map((effort) => effort.reasoningEffort) || [],
+                defaultReasoning: item.defaultReasoningEffort || '',
+              }
+            }))
           }
         } catch {}
       }
@@ -296,11 +321,13 @@ async function getOpenCodeModels() {
       const metadata = JSON.parse(match[2])
       const reasoning = Object.keys(metadata.variants || {})
       const id = match[1].trim()
+      const contextWindow = Number(metadata.limit?.context) || undefined
       metadataById.set(id, {
         id,
         label: metadata.name || id,
         description: metadata.family || '',
-        contextWindow: Number(metadata.limit?.context) || undefined,
+        contextWindow,
+        contextWindowSource: contextWindow ? 'model-meta' : 'unknown',
         reasoning,
         defaultReasoning: reasoning.includes('medium') ? 'medium' : reasoning[0] || '',
       })
@@ -407,12 +434,20 @@ async function getClaudeModels() {
         if (resolved) labels.set(alias, resolved)
       } catch {}
     })
-    return available.map((id) => ({
-      id,
-      label: labels.get(id) || id.replace(/^./, (letter) => letter.toUpperCase()),
-      reasoning: ['low', 'medium', 'high', 'xhigh', 'max'],
-      defaultReasoning: 'high',
-    }))
+    return available.map((id) => {
+      const fallback = fallbackContextWindow('claude', id)
+      return {
+        id,
+        label: labels.get(id) || id.replace(/^./, (letter) => letter.toUpperCase()),
+        // Claude CLI does not expose context windows per alias; use the vetted
+        // per-model fallback. A runtime modelUsage.contextWindow event, when
+        // available, supersedes this at display time.
+        contextWindow: fallback || undefined,
+        contextWindowSource: fallback ? 'fallback' : 'unknown',
+        reasoning: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultReasoning: 'high',
+      }
+    })
   } catch {
     return fallbackModels.claude
   }
@@ -810,6 +845,42 @@ ipcMain.handle('provider:limits', async (_event, request) => {
 
 ipcMain.handle('sessions:list', () => readSessions())
 
+ipcMain.handle('usage:stats', () => {
+  const userData = app.getPath('userData')
+  const home = app.getPath('home')
+  const profiles = mergeProfiles(readProfiles(userData, home), detectDefaultProfiles(home))
+  const entries = readAllSpendLedgers(userData)
+  const records = entries.map(normalizeUsageRecord).filter(Boolean)
+  const profileLabels = Object.fromEntries(profiles.map((p) => [p.id, p.name]))
+  return { records, profileLabels }
+})
+
+ipcMain.handle('context:summary', (_event, sessionId) => {
+  if (typeof sessionId !== 'string' || !sessionId) return buildEmptySummary()
+  const userData = app.getPath('userData')
+  const runs = listRuns(userData, sessionId)
+  const manifests = []
+  for (const receipt of runs) {
+    const manifest = readContextManifest(userData, receipt.runId)
+    if (manifest) manifests.push(manifest)
+  }
+  // Active runs that have not finished yet contribute an in-memory snapshot.
+  for (const invocation of activeContextInvocations.values()) {
+    if (invocation.sessionId === sessionId) manifests.push(contextSnapshot(invocation))
+  }
+  if (!manifests.length) {
+    const session = readSessions().find((s) => s.id === sessionId)
+    if (session) return buildLegacySummary(session.messages, session.provider, session.model)
+    return buildEmptySummary()
+  }
+  const originalMessages = []
+  const session = readSessions().find((s) => s.id === sessionId)
+  if (session) {
+    originalMessages.push(...session.messages.filter((m) => m.role === 'user' && m.id !== 'hello').map((m) => m.content))
+  }
+  return aggregateSessionSummary(manifests, originalMessages)
+})
+
 ipcMain.handle('lanes:state', (_event, request = {}) => {
   const sessionId = typeof request === 'string' ? request : request?.sessionId
   if (!sessionId) return {}
@@ -988,6 +1059,14 @@ ipcMain.handle('budget:spend', (_event, request = {}) => {
   return { total: totalSpend(entries), entries: entries.slice(-50) }
 })
 
+ipcMain.handle('context:snapshot', (_event, runId) => {
+  if (typeof runId !== 'string' || !runId) return null
+  const invocation = activeContextInvocations.get(runId)
+  if (invocation) return contextSnapshot(invocation)
+  const manifest = readContextManifest(app.getPath('userData'), runId)
+  return manifest || null
+})
+
 ipcMain.handle('sessions:create', (_event, request = {}) => {
   const workspace = path.resolve(request.workspace || app.getPath('home'))
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) throw new Error('Workspace does not exist')
@@ -1123,33 +1202,35 @@ function extractRunSummary(provider, raw) {
   return answers.length ? answers[answers.length - 1].trim().slice(0, 5000) : ''
 }
 
-function extractTokenUsage(provider, raw) {
-  const number = (value) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
-  for (const line of String(raw || '').split(/\r?\n/).filter(Boolean)) {
-    try {
-      const event = JSON.parse(line)
-      if (provider === 'codex' && event.type === 'turn.completed' && event.usage) {
-        return {
-          inputTokens: number(event.usage.input_tokens),
-          cachedInputTokens: number(event.usage.cached_input_tokens),
-          outputTokens: number(event.usage.output_tokens),
-          reasoningTokens: number(event.usage.reasoning_output_tokens),
-          totalTokens: number(event.usage.input_tokens) + number(event.usage.output_tokens),
-        }
-      }
-      if (provider === 'claude' && event.type === 'result' && event.usage) {
-        const input = number(event.usage.input_tokens)
-        const cached = number(event.usage.cache_read_input_tokens) + number(event.usage.cache_creation_input_tokens)
-        const output = number(event.usage.output_tokens)
-        return { inputTokens: input, cachedInputTokens: cached, outputTokens: output, reasoningTokens: 0, totalTokens: input + cached + output }
-      }
-      if (provider === 'opencode' && (event.type === 'step_finish' || event.type === 'step-finish') && event.part?.tokens) {
-        const t = event.part.tokens
-        return { inputTokens: number(t.input), cachedInputTokens: number(t.cache?.read) + number(t.cache?.write), outputTokens: number(t.output), reasoningTokens: number(t.reasoning), totalTokens: number(t.input) + number(t.output) + number(t.reasoning) }
-      }
-    } catch {}
-  }
-  return null
+// Token-usage extraction is delegated to the shared module (token-usage.cjs) so
+// the renderer and main process share one parser. The local wrapper preserves
+// the (provider, raw) signature used by telemetry/cost call sites and forwards
+// the model id when known so the context-window fallback table can apply.
+function extractTokenUsage(provider, raw, model) {
+  return extractTokenUsageShared(provider, raw, { model: model || '' })
+}
+
+function normalizeContextComponent(component) {
+  if (!component || typeof component !== 'object') return null
+  return createContextItem({
+    category: typeof component.category === 'string' ? component.category : 'unknown',
+    source: typeof component.source === 'string' ? component.source : 'unknown',
+    text: typeof component.text === 'string' ? component.text : '',
+    status: ['reported', 'estimated', 'unknown'].includes(component.status) ? component.status : undefined,
+    tokens: Number.isFinite(component.tokens) ? component.tokens : null,
+  })
+}
+
+function addUnknownSystemState(invocation, note) {
+  invocation.components.push(createContextItem({
+    category: COMPONENT_CATEGORIES.providerSystemState,
+    source: 'provider-cli',
+    runId: invocation.runId,
+    agent: invocation.agent,
+    text: note || 'Provider-internal system instructions and CLI state are not visible to AgentDock.',
+    status: 'unknown',
+  }))
+  return invocation
 }
 
 // Delegation Belt (#12): per-run registry of sub-runs spawned by the agent via
@@ -1261,7 +1342,7 @@ async function executeDelegateSubRun({ kind, params, parentRunId, sessionId, pro
     if (patch) writePatch(userData, subRunId, patch)
     const exitCode = Number.isFinite(code) ? code : -1
     const outcome = exitCode === 0 ? 'success' : 'blocked'
-    const usage = extractTokenUsage(provider, rawOutput)
+    const usage = extractTokenUsage(provider, rawOutput, params.model)
     const costEstimate = estimateRunCost(provider, params.model, usage)
     if (sessionId) {
       try {
@@ -1433,6 +1514,56 @@ ipcMain.handle('agent:run', async (event, request) => {
     reservationId = reservation.id
   }
 
+  // Build context manifest. Unknown provider-internal state is represented as
+  // an explicit unknown component; everything else is known/estimated.
+  const runType = request.pipelineStep ? 'pipeline' : 'run'
+  const contextInvocation = createContextInvocation({
+    runId,
+    parentRunId: request.parentRunId || null,
+    provider: request.provider,
+    model: request.model,
+    runType,
+    pipelineStep: request.pipelineStep || null,
+    startedAt,
+  })
+  contextInvocation.sessionId = sessionId
+  if (Array.isArray(request.contextComponents)) {
+    for (const component of request.contextComponents) {
+      const normalized = normalizeContextComponent(component)
+      if (normalized) {
+        normalized.runId = runId
+        normalized.agent = request.agent || 'default'
+        contextInvocation.components.push(normalized)
+      }
+    }
+  }
+  if (request.continuationPacket) {
+    contextInvocation.components.push(createContextItem({
+      category: COMPONENT_CATEGORIES.continuationPacket,
+      source: 'lane-continuity',
+      runId,
+      agent: request.agent || 'default',
+      text: typeof request.continuationPacket === 'string' ? request.continuationPacket : '',
+    }))
+  }
+  if (mode !== 'resume') {
+    const intentPrefix = planPrefix(intent)
+    if (intentPrefix) contextInvocation.components.push(createContextItem({ category: COMPONENT_CATEGORIES.intentPrefix, source: `intent-${intent}`, runId, agent: request.agent || 'default', text: intentPrefix }))
+    const defaultGlobalSkills = readSettings().defaultGlobalSkills
+    if (defaultGlobalSkills.length) {
+      contextInvocation.components.push(createContextItem({ category: COMPONENT_CATEGORIES.globalSkill, source: 'default-global-skills', runId, agent: request.agent || 'default', text: defaultGlobalSkills.join(', ') }))
+    }
+    contextInvocation.components.push(createContextItem({ category: COMPONENT_CATEGORIES.browserAwareness, source: 'agentdock-browser', runId, agent: request.agent || 'default', text: 'Browser awareness prompt injected via agentdock-browser MCP.' }))
+    if (delegateConfig.enabled && delegateDescriptor) {
+      contextInvocation.components.push(createContextItem({ category: COMPONENT_CATEGORIES.delegateAwareness, source: 'agentdock-delegate', runId, agent: request.agent || 'default', text: 'Delegation awareness prompt injected via agentdock-delegate MCP.' }))
+    }
+  } else {
+    contextInvocation.components.push(createContextItem({ category: COMPONENT_CATEGORIES.resumeInstruction, source: 'resume', runId, agent: request.agent || 'default', text: request.lastPrompt || request.prompt || 'Continue from where we left off.' }))
+  }
+  addUnknownSystemState(contextInvocation, 'Provider-internal system prompts and CLI internal state are not visible to AgentDock.')
+  activeContextInvocations.set(runId, contextInvocation)
+  writeContextManifest(userData, runId, contextInvocation)
+
   let child
   if (mode === 'resume') {
     browserOptions = browserMcpLaunchOptions(request.provider, descriptor, runId, permissions.env)
@@ -1471,7 +1602,7 @@ ipcMain.handle('agent:run', async (event, request) => {
     })
   }
   child.stdin.end()
-  const controller = { child, cleanup: browserOptions.cleanup, delegateMcp, envelope: { ...envelope, workspace }, cancelled: false }
+  const controller = { child, cleanup: browserOptions.cleanup, delegateMcp, envelope: { ...envelope, workspace }, cancelled: false, contextInvocation }
   running.set(runId, controller)
   let rawOutput = ''
   child.stdout.on('data', (chunk) => { const text = chunk.toString(); emit('stdout', text); appendArtifact('stdout', text); rawOutput += text })
@@ -1667,7 +1798,7 @@ ipcMain.handle('agent:run', async (event, request) => {
     let budgetInfo = null
     if (sessionId) {
       try {
-        const runUsage = extractTokenUsage(request.provider, rawOutput)
+        const runUsage = extractTokenUsage(request.provider, rawOutput, request.model)
         const costEstimate = estimateRunCost(request.provider, request.model, runUsage)
         costEvidence = costEstimate
         appendSpendEntry(userData, sessionId, {
@@ -1700,6 +1831,12 @@ ipcMain.handle('agent:run', async (event, request) => {
       cleanupWarning = cleanupResult.warning
     }
 
+    // Finalize context manifest with provider usage and reconciliation.
+    const runUsage = extractTokenUsage(request.provider, rawOutput, request.model)
+    reconcileInvocation(contextInvocation, runUsage)
+    writeContextManifest(userData, runId, contextInvocation)
+    activeContextInvocations.delete(runId)
+
     // 5.1: Single terminal receipt
     const warnings = []
     if (cleanupWarning) warnings.push(cleanupWarning)
@@ -1720,9 +1857,8 @@ ipcMain.handle('agent:run', async (event, request) => {
       ...(planResult?.hash ? { planHash: planResult.hash } : {}),
     }))
     // 6.1: Write telemetry.yaml and manifest.json for terminal artifacts
-    const runUsage = extractTokenUsage(request.provider, rawOutput)
     writeTelemetry(userData, runId, { provider: request.provider, model: request.model, intent, outcome: finalOutcome, exitCode, startedAt, finishedAt: Date.now(), usage: runUsage, cost: costEvidence })
-    writeManifest(userData, runId, { kind: intent === 'plan' ? 'plan' : 'run' })
+    writeManifest(userData, runId, { kind: intent === 'plan' ? 'plan' : 'run', extraFiles: [{ path: 'context.json', size: 0, contentType: 'application/json' }] })
     const outcomeEvent = JSON.stringify({ type: 'agentdock.run.outcome', runId, outcome: finalOutcome, exitCode, provider: request.provider, profileId: profileRef })
     emit('stdout', `\n${outcomeEvent}\n`)
     appendArtifact('stdout', `\n${outcomeEvent}\n`)
@@ -1732,9 +1868,11 @@ ipcMain.handle('agent:run', async (event, request) => {
         const sessions = readSessions()
         const session = sessions.find((item) => item.id === sessionId)
         if (session) {
+          const laneUsage = runUsage ? normalizeTokenUsageShared(runUsage) : undefined
           const updatedLanes = setLaneState(session.lanes || {}, request.provider, profileRef, {
             lastExitCode: exitCode,
             lastRunFailed: exitCode !== 0,
+            ...(laneUsage ? { usage: laneUsage } : {}),
           })
           writeSessions(sessions.map((item) => item.id === sessionId ? { ...item, lanes: updatedLanes, updatedAt: Date.now() } : item))
         }

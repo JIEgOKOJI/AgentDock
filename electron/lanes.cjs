@@ -1,5 +1,6 @@
 const path = require('node:path')
 const fs = require('node:fs')
+const { normalizeTokenUsage } = require('./token-usage.cjs')
 
 const DEFAULT_LANE_STATE = { cliSessionId: '', lastPrompt: '', lastExitCode: null, lastRunFailed: false }
 
@@ -29,11 +30,13 @@ function ensureLaneDir(userData, sessionId, provider, profileId) {
 
 function normalizeLaneState(value) {
   if (!value || typeof value !== 'object') return { ...DEFAULT_LANE_STATE }
+  const usage = normalizeTokenUsage(value.usage, { legacy: true })
   return {
     cliSessionId: typeof value.cliSessionId === 'string' && value.cliSessionId ? value.cliSessionId : '',
     lastPrompt: typeof value.lastPrompt === 'string' && value.lastPrompt ? value.lastPrompt : '',
     lastExitCode: Number.isFinite(value.lastExitCode) ? value.lastExitCode : null,
     lastRunFailed: typeof value.lastRunFailed === 'boolean' ? value.lastRunFailed : false,
+    ...(usage ? { usage } : {}),
   }
 }
 

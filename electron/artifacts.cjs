@@ -113,7 +113,10 @@ function writeTelemetry(userData, runId, telemetry) {
       lines.push(`output_tokens: ${telemetry.usage.outputTokens || 0}`)
       lines.push(`reasoning_tokens: ${telemetry.usage.reasoningTokens || 0}`)
       lines.push(`total_tokens: ${telemetry.usage.totalTokens || 0}`)
+      if (telemetry.usage.contextTokens != null) lines.push(`context_tokens: ${telemetry.usage.contextTokens}`)
+      if (telemetry.usage.contextSource) lines.push(`context_source: ${telemetry.usage.contextSource}`)
       if (telemetry.usage.contextWindow) lines.push(`context_window: ${telemetry.usage.contextWindow}`)
+      if (telemetry.usage.contextWindowSource) lines.push(`context_window_source: ${telemetry.usage.contextWindowSource}`)
       lines.push('')
     }
     if (telemetry?.cost) {

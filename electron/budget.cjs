@@ -120,6 +120,24 @@ function profileSpend(userData, sessionId, profileId) {
   return totalSpend(entries.filter((entry) => entry.profileId === profileId))
 }
 
+function readAllSpendLedgers(userData) {
+  const dir = budgetDir(userData)
+  try {
+    const files = fs.readdirSync(dir)
+    const all = []
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue
+      const sessionId = file.slice(0, -'.jsonl'.length)
+      for (const entry of readSpendLedger(userData, sessionId)) {
+        if (entry && typeof entry === 'object') all.push(entry)
+      }
+    }
+    return all
+  } catch {
+    return []
+  }
+}
+
 const reservations = new Map()
 
 function reserveBudget(sessionId, amount, metadata = {}) {
@@ -183,6 +201,7 @@ module.exports = {
   totalSpend,
   sessionSpend,
   profileSpend,
+  readAllSpendLedgers,
   reserveBudget,
   releaseReservation,
   settleReservation,
